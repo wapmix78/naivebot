@@ -862,7 +862,6 @@ class LocalPanelClient:
 
 
 panel = LocalPanelClient()
-panel = NaivePanelClient()
 
 # Трекер недоступности панели (для health-check алертов)
 _panel_down_since: Optional[float] = None
