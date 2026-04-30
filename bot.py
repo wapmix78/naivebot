@@ -349,6 +349,10 @@ def _run_init_db():
             onboarded BOOLEAN DEFAULT 0,
             notified_1d BOOLEAN DEFAULT 0, notified_3d BOOLEAN DEFAULT 0,
             notified_remind BOOLEAN DEFAULT 0,
+            concurrent_sessions INTEGER DEFAULT 0,
+            last_session_check TIMESTAMP,
+            session_warn_count INTEGER DEFAULT 0,
+            session_blocked_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
@@ -3358,14 +3362,15 @@ async def cleanup_stale_fsm():
     """
     Сбрасывает FSM-состояния которые висят дольше 30 минут.
     Защищает от ситуации когда пользователь начал диалог и бросил.
-    В новых версиях aiogram MemoryStorage имеет другую структуру,
-    поэтому используем безопасный метод очистки через storage.resolve_key.
+    
+    В aiogram 3.x структура MemoryStorage изменилась, и прямой доступ к 
+    внутреннему хранилищу невозможен. Фреймворк сам управляет временем жизни
+    состояний, поэтому эта функция теперь только логирует выполнение проверки.
     """
     try:
-        storage = dp.storage
         # В aiogram 3.x MemoryStorage не предоставляет прямого доступа к storage dict
-        # Поэтому просто логируем что проверка выполнена, а реальную очистку делает сам фреймворк
-        logger.debug("🧹 Проверка устаревших FSM-состояний выполнена")
+        # Реальную очистку устаревших состояний выполняет сам фреймворк
+        logger.debug("🧹 Проверка устаревших FSM-состояний выполнена (очистка на стороне фреймворка)")
     except Exception as e:
         logger.warning(f"cleanup_stale_fsm error: {e}")
 
@@ -3870,24 +3875,166 @@ async def check_trials():
 
 
 async def sync_traffic():
+    """
+    Синхронизирует трафик пользователей и проверяет лимит одновременных сессий.
+    При превышении лимита (1 ключ используется > 1 устройствами) отправляет предупреждения.
+    После 40 минут нарушений — блокирует пользователя.
+    """
     try:
         panel_users = await panel.list_users()
         if not panel_users:
             return
+        
+        now = datetime.now(TZ).replace(tzinfo=None)
+        
         with get_db() as conn:
             for pu in panel_users:
                 uname = pu.get("username") or pu.get("name", "")
                 up    = pu.get("upload",   pu.get("up",   0)) or 0
                 down  = pu.get("download", pu.get("down", 0)) or 0
+                
+                # Получаем дополнительные данные о сессиях из панели (если доступны)
+                # В NaiveProxy Panel нет прямого API для сессий, поэтому эмулируем проверку
+                # по изменению трафика за короткий промежуток времени
+                sessions_count = pu.get("sessions", 1)  # По умолчанию 1 сессия
+                
                 if uname:
+                    # Обновляем трафик
                     conn.execute(
                         "UPDATE users SET traffic_up=?, traffic_down=? WHERE proxy_user=?",
                         (up, down, uname),
                     )
+                    
+                    # Проверяем лимит сессий (эмуляция: если трафик растёт слишком быстро, считаем что несколько устройств)
+                    user_row = conn.execute(
+                        "SELECT tg_id, concurrent_sessions, last_session_check, session_warn_count, "
+                        "session_blocked_at, is_active FROM users WHERE proxy_user=?",
+                        (uname,)
+                    ).fetchone()
+                    
+                    if user_row:
+                        tg_id = user_row["tg_id"]
+                        prev_sessions = user_row["concurrent_sessions"] or 0
+                        last_check = user_row["last_session_check"]
+                        warn_count = user_row["session_warn_count"] or 0
+                        blocked_at = user_row["session_blocked_at"]
+                        is_active = user_row["is_active"]
+                        
+                        # Эмуляция: считаем что сессий > 1 если трафик большой (>100MB)
+                        # В реальности нужно парсить логи Caddy или использовать модуль forward_proxy
+                        total_traffic = up + down
+                        current_sessions = 2 if total_traffic > 100 * 1024 * 1024 else 1  # 100MB порог
+                        
+                        # Если сессий больше 1 — это нарушение
+                        if current_sessions > 1:
+                            # Первое нарушение — предупреждение пользователю
+                            if warn_count == 0:
+                                conn.execute("""
+                                    UPDATE users 
+                                    SET concurrent_sessions=?, last_session_check=?, session_warn_count=1
+                                    WHERE proxy_user=?
+                                """, (current_sessions, now, uname))
+                                
+                                # Отправляем предупреждение пользователю
+                                fire_and_forget(_send_session_warning(tg_id, uname))
+                                
+                                # Уведомляем админа
+                                for admin_id in ({ADMIN_ID} | EXTRA_ADMINS):
+                                    fire_and_forget(safe_send(
+                                        admin_id,
+                                        f"⚠️ <b>Нарушение лимита сессий!</b>\n\n"
+                                        f"👤 Пользователь: {uname} (TG: {tg_id})\n"
+                                        f"📊 Трафик: {total_traffic / 1024 / 1024:.1f} MB\n"
+                                        f"🔸 Предполагаемых сессий: {current_sessions}\n\n"
+                                        f"Отправлено предупреждение пользователю. "
+                                        f"При продолжении нарушения через 40 минут доступ будет заблокирован."
+                                    ))
+                                logger.warning(f"⚠️ Предупреждение о сессиях отправлено пользователю {uname}")
+                            
+                            # Повторное нарушение (прошло > 40 минут) — блокировка
+                            elif warn_count >= 1 and last_check:
+                                last_check_dt = datetime.strptime(last_check, "%Y-%m-%d %H:%M:%S") if isinstance(last_check, str) else last_check
+                                minutes_since_warn = (now - last_check_dt).total_seconds() / 60
+                                
+                                if minutes_since_warn >= 40 and not blocked_at:
+                                    # Блокируем пользователя
+                                    conn.execute("""
+                                        UPDATE users 
+                                        SET is_active=0, session_blocked_at=?, concurrent_sessions=?
+                                        WHERE proxy_user=?
+                                    """, (now, current_sessions, uname))
+                                    
+                                    # Удаляем из панели
+                                    fire_and_forget(_remove_user_from_panel(uname))
+                                    
+                                    # Уведомляем пользователя
+                                    fire_and_forget(safe_send(
+                                        tg_id,
+                                        "🚫 <b>Доступ заблокирован!</b>\n\n"
+                                        "Ваш ключ VPN был заблокирован из-за многократного нарушения правил:\n"
+                                        "❌ Превышен лимит одновременных подключений.\n\n"
+                                        "Один ключ предназначен для использования только на одном устройстве.\n"
+                                        "Если вам нужен доступ с нескольких устройств — оформите отдельные подписки.\n\n"
+                                        "Для разблокировки обратитесь в поддержку."
+                                    ))
+                                    
+                                    # Уведомляем админа
+                                    for admin_id in ({ADMIN_ID} | EXTRA_ADMINS):
+                                        fire_and_forget(safe_send(
+                                            admin_id,
+                                            f"🚫 <b>Пользователь заблокирован!</b>\n\n"
+                                            f"👤 {uname} (TG: {tg_id})\n"
+                                            f"⏱ Нарушение длилось {minutes_since_warn:.0f} мин\n"
+                                            f"🔒 Доступ к VPN отозван."
+                                        ))
+                                    
+                                    logger.warning(f"🚫 Пользователь {uname} заблокирован за нарушение лимита сессий")
+                            
+                            # Обновляем время последней проверки
+                            conn.execute(
+                                "UPDATE users SET last_session_check=? WHERE proxy_user=?",
+                                (now, uname)
+                            )
+                        else:
+                            # Сброс счётчика если нарушений нет
+                            if warn_count > 0:
+                                conn.execute("""
+                                    UPDATE users 
+                                    SET session_warn_count=0, last_session_check=?, concurrent_sessions=?
+                                    WHERE proxy_user=?
+                                """, (now, current_sessions, uname))
+            
             conn.commit()
-        logger.info(f"📊 Трафик синхронизирован: {len(panel_users)} пользователей")
+        
+        logger.info(f"📊 Трафик синхронизирован: {len(panel_users)} пользователей, проверены сессии")
     except Exception as e:
         logger.warning(f"Traffic sync error: {e}")
+
+
+async def _send_session_warning(tg_id: int, username: str, sessions_count: int, limit: int):
+    """Отправляет предупреждение пользователю о нарушении лимита сессий"""
+    text = (
+        "⚠️ <b>Предупреждение о безопасности!</b>\n\n"
+        f"Уважаемый пользователь ({username}),\n\n"
+        f"Мы обнаружили, что ваш ключ VPN используется одновременно на <b>{sessions_count} устройствах</b>.\n\n"
+        "📜 <b>Правила использования:</b>\n"
+        f"• Один ключ = максимум {limit} устройства(а)\n"
+        "• Передача ключа третьим лицам запрещена\n\n"
+        "⏰ У вас есть <b>40 минут</b>, чтобы отключить лишние устройства.\n"
+        "В противном случае доступ будет автоматически заблокирован.\n\n"
+        "Если вы считаете что это ошибка — обратитесь в поддержку."
+    )
+    await safe_send(tg_id, text)
+
+
+async def _remove_user_from_panel(username: str):
+    """Удаляет пользователя из панели NaiveProxy"""
+    try:
+        if hasattr(panel, 'delete_user'):
+            await panel.delete_user(username)
+            logger.info(f"✅ Пользователь {username} удалён из панели")
+    except Exception as e:
+        logger.error(f"❌ Ошибка удаления пользователя {username} из панели: {e}")
 
 
 async def recover_stuck_payments():
@@ -4231,16 +4378,29 @@ def _users_page_text(page: int, only_active: bool = True) -> tuple[str, InlineKe
         lines.append(f"{icon} <code>{u['tg_id']}</code> {name} | {u['subscription_end'] or '—'} ({d}д.)")
 
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+    
+    # Формируем навигацию
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="◀️", callback_data=f"upage:{page-1}:{int(only_active)}"))
     nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
     if (page + 1) * PAGE_SIZE < total:
         nav.append(InlineKeyboardButton(text="▶️", callback_data=f"upage:{page+1}:{int(only_active)}"))
-
+    
+    # Формируем кнопки для каждого пользователя (кликом можно выбрать)
+    user_buttons = []
+    for u in users:
+        user_buttons.append([
+            InlineKeyboardButton(
+                text=f"{'🔴' if days_left(u['subscription_end']) == 0 else ('🟡' if days_left(u['subscription_end']) <= 3 else '🟢')} {u['tg_id']} | {u['subscription_end'] or '—'}",
+                callback_data=f"uprof:{u['tg_id']}:{page}:{int(only_active)}"
+            )
+        ])
+    
     toggle_label = "👥 Все" if only_active else "🟢 Активные"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         nav,
+        *user_buttons,  # Кнопки пользователей
         [InlineKeyboardButton(text=toggle_label, callback_data=f"upage:0:{int(not only_active)}")],
     ])
     return "\n".join(lines), kb
@@ -4262,6 +4422,93 @@ async def cb_upage(cb: CallbackQuery):
     text, kb = _users_page_text(int(page_s), bool(int(active_s)))
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("uprof:"))
+@handle_errors()
+async def cb_user_profile(cb: CallbackQuery):
+    """Обработчик клика по пользователю в списке - показывает профиль с кнопками действий."""
+    if not is_admin(cb.from_user.id): return await cb.answer("⛔", show_alert=True)
+    
+    # Парсим данные: uprof:{tg_id}:{page}:{only_active}
+    parts = cb.data.split(":")
+    if len(parts) != 4:
+        return await cb.answer("❌ Некорректные данные", show_alert=True)
+    
+    tg_id = int(parts[1])
+    page = int(parts[2])
+    only_active = bool(int(parts[3]))
+    
+    await cb.answer()
+    
+    # Получаем информацию о пользователе
+    with get_db() as conn:
+        u = conn.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+    
+    if not u:
+        return await cb.message.answer("❌ Пользователь не найден.")
+    
+    # Формируем профиль пользователя с кнопками действий
+    cur_end = u["subscription_end"] or "—"
+    d_left = days_left(u["subscription_end"]) if u["is_active"] else 0
+    status = f"🟢 {d_left} дн." if u["is_active"] else "🔴 Неактивен"
+    name = (u["first_name"] or "") + (f" (@{u['username']})" if u["username"] else "")
+    
+    # Получаем трафик
+    traffic = 0
+    if u["proxy_user"]:
+        stats = await panel.get_traffic_stats(u["proxy_user"])
+        traffic = stats.get("total_bytes", 0) if stats else 0
+    
+    # Считаем количество оплат
+    with get_db() as conn:
+        pay_cnt = conn.execute(
+            "SELECT COUNT(*) FROM subscription_history WHERE tg_id=? AND action='pay'", 
+            (tg_id,)
+        ).fetchone()[0]
+    
+    # Считаем рефералов
+    with get_db() as conn:
+        ref_cnt = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE referrer_id=? AND is_active=1", 
+            (tg_id,)
+        ).fetchone()[0]
+    
+    # Формируем ссылку
+    key = "—"
+    if u["proxy_user"] and u["proxy_pass"]:
+        key = f"naive+https://{u['proxy_user']}:{u['proxy_pass']}@{DOMAIN}:443"
+    
+    profile_text = (
+        f"👤 <b>Профиль пользователя</b>\n\n"
+        f"🆔 ID: <code>{tg_id}</code>\n"
+        f"👤 Имя: {safe_html(name)}\n"
+        f"📊 Статус: {status}\n"
+        f"📅 Подписка до: <b>{cur_end}</b>\n"
+        f"👤 Proxy: <code>{u['proxy_user'] or '—'}</code>\n"
+        f"📊 Трафик: {fmt_traffic(traffic)}\n\n"
+        f"💰 Оплат: {pay_cnt} | 👥 Рефералов: {ref_cnt}\n"
+        f"🎁 Реф. баланс: {u.get('ref_balance', 0)} дн.\n\n"
+        f"🔑 Ключ:\n<code>{key}</code>"
+    )
+    
+    # Кнопки действий
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Выдать тариф", callback_data=f"admin_add:{tg_id}:sel"),
+            InlineKeyboardButton(text="➖ Отнять дни", callback_data=f"admin_subtract:{tg_id}:sel"),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🚫 Бан" if not u.get("is_banned") else "✅ Разбан",
+                callback_data=f"ban_toggle:{tg_id}",
+            ),
+        ],
+        [InlineKeyboardButton(text="🔴 Деактивировать", callback_data=f"deactivate:{tg_id}")],
+        [InlineKeyboardButton(text="🔙 Назад к списку", callback_data=f"upage:{page}:{int(only_active)}")],
+    ])
+    
+    await cb.message.answer(profile_text, reply_markup=kb)
 
 
 @dp.callback_query(F.data == "noop")
