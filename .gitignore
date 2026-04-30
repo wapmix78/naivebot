@@ -1,0 +1,39 @@
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Backup files
+*.backup
+
+# Dependencies
+.venv/
+venv/
+env/
+.env
+.env.local
+.env.*
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
+dist/
+build/
+target/
+*.o
+*.obj
+*.so
+*.a
+*.dll
+*.exe
+```
