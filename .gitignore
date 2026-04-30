@@ -27,4 +27,8 @@ node_modules/
 dist/
 build/
 target/
+
+# OS
+.DS_Store
+Thumbs.db
 ```
