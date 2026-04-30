@@ -11,13 +11,22 @@ import os, csv, io, json, re, sqlite3, asyncio, logging
 import secrets, string, time, zipfile
 from html import escape
 from enum import Enum
-from datetime import datetime, timedelta, date
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional, List
 from contextlib import contextmanager
 from pathlib import Path
 from collections import defaultdict
 from functools import wraps
 from dotenv import load_dotenv
+
+
+class PaymentStatus(str, Enum):
+    PENDING           = "pending"
+    AWAITING_CONFIRM  = "awaiting_confirm"
+    PROCESSING        = "processing"
+    APPROVED          = "approved"
+    REJECTED          = "rejected"
+    CANCELLED         = "cancelled"
 
 import qrcode
 
@@ -46,12 +55,15 @@ import pytz
 # ══════════════════════════════════════════════════════════════════════════════
 _env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(_env, override=True)
+load_dotenv(override=True)
 
 BOT_TOKEN     = os.getenv("BOT_TOKEN",     "YOUR_BOT_TOKEN")
 ADMIN_ID      = int(os.getenv("ADMIN_ID",  "0"))
 PANEL_URL        = os.getenv("PANEL_URL",        "http://127.0.0.1:3000")
 PANEL_USER       = os.getenv("PANEL_USER",       "admin")
 PANEL_PASS       = os.getenv("PANEL_PASS",       "admin")
+# PANEL_VERIFY_SSL=false в .env отключает проверку сертификата (для self-signed).
+# По умолчанию — включена. Не отключай без необходимости (MITM-уязвимость).
 PANEL_VERIFY_SSL = os.getenv("PANEL_VERIFY_SSL", "true").lower() not in ("0", "false", "no")
 DOMAIN        = os.getenv("DOMAIN",        "vpn.example.com")
 DB_PATH       = os.getenv("DB_PATH",       "/opt/vpn_bot/bot.db")
@@ -64,11 +76,17 @@ TIMEZONE      = os.getenv("TZ",            "Europe/Moscow")
 TZ            = pytz.timezone(TIMEZONE)
 TRIAL_HOURS   = int(os.getenv("TRIAL_HOURS", "48"))
 
+# Дополнительные администраторы (через запятую в .env: EXTRA_ADMINS=123,456)
 _extra = os.getenv("EXTRA_ADMINS", "")
 EXTRA_ADMINS: set[int] = {int(x.strip()) for x in _extra.split(",") if x.strip().isdigit()}
 
+# Тарифы по умолчанию — загружаются из БД при старте, это только fallback
 DEFAULT_TARIFFS = {30: 400, 90: 1100, 180: 1500}
+
+# Реферальная система: процент дней тарифа
 REF_BONUS_PERCENT = float(os.getenv("REF_BONUS_PERCENT", "20"))
+
+# Страницы списка пользователей
 PAGE_SIZE = 10
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -88,16 +106,14 @@ logger = logging.getLogger("naive_bot")
 #  УТИЛИТЫ
 # ══════════════════════════════════════════════════════════════════════════════
 _background_tasks: set = set()
-_bg_semaphore = asyncio.Semaphore(200)
+_bg_semaphore = asyncio.Semaphore(200)  # не более 200 фоновых задач одновременно
 sync_lock = asyncio.Lock()
 
 def fire_and_forget(coro):
+    """Запускает корутину фоново. Не более 200 задач одновременно."""
     async def _guarded():
-        try:
-            async with _bg_semaphore:
-                await coro
-        except Exception as e:
-            logger.exception(f"Ошибка в фоновой задаче: {e}")
+        async with _bg_semaphore:
+            await coro
     task = asyncio.create_task(_guarded())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -108,8 +124,9 @@ class RateLimiter:
     def __init__(self): self._ts: dict[int, float] = defaultdict(float)
     def allow(self, uid: int, interval: float = 1.5) -> bool:
         now = time.time()
+        # Чистим устаревшие записи раз в 1000 вызовов чтобы не копить память
         if len(self._ts) > 1000:
-            cutoff = now - 3600
+            cutoff = now - 3600  # записи старше 1 часа удаляем
             self._ts = {k: v for k, v in self._ts.items() if v > cutoff}
         if now - self._ts[uid] >= interval:
             self._ts[uid] = now
@@ -160,6 +177,12 @@ def handle_errors():
 
 
 async def safe_send(chat_id: int, text: str, **kwargs) -> bool:
+    """
+    Отправляет сообщение с retry + exponential backoff.
+    - TelegramRetryAfter: ждёт сколько Telegram просит
+    - Сетевые ошибки: 3 попытки с задержкой 1s, 3s, 7s
+    - Заблокированный/удалённый пользователь: сразу False без retry
+    """
     delays = [1, 3, 7]
     for attempt, delay in enumerate(delays):
         try:
@@ -172,6 +195,7 @@ async def safe_send(chat_id: int, text: str, **kwargs) -> bool:
             if any(x in err for x in ("bot was blocked", "user is deactivated", "chat not found", "forbidden")):
                 logger.debug(f"safe_send: пользователь {chat_id} недоступен — {e}")
                 return False
+            # Сетевая / временная ошибка — ретраим с backoff
             logger.warning(f"safe_send attempt {attempt+1}/3: chat_id={chat_id} — {e}")
             if attempt < len(delays) - 1:
                 await asyncio.sleep(delay)
@@ -183,6 +207,7 @@ async def safe_send(chat_id: int, text: str, **kwargs) -> bool:
 
 
 async def send_long(target, text: str, **kwargs) -> None:
+    """Отправляет длинное сообщение частями по 4000 символов."""
     MAX = 4000
     first = True
     while text:
@@ -247,6 +272,11 @@ def _make_qr_bytes(text: str) -> bytes:
 
 
 async def send_key_with_qr(target, key: str, caption: str, **kwargs):
+    """
+    Отправляет QR-код как фото с подписью ключа.
+    target — Message (answer_photo) или int (bot.send_photo).
+    Fallback на текст если QR не сгенерировался.
+    """
     try:
         qr_bytes = await asyncio.get_running_loop().run_in_executor(None, _make_qr_bytes, key)
         photo    = types.BufferedInputFile(qr_bytes, filename="qr.png")
@@ -257,6 +287,7 @@ async def send_key_with_qr(target, key: str, caption: str, **kwargs):
         return
     except Exception as e:
         logger.warning(f"QR generation failed: {e}")
+    # Fallback — текст без QR
     if isinstance(target, int):
         await safe_send(target, caption, **kwargs)
     else:
@@ -290,6 +321,7 @@ def _ensure_unique_proxy_user(conn: sqlite3.Connection, base: str) -> str:
 
 
 def safe_cb_int(data: str, pos: int = 1) -> Optional[int]:
+    """Безопасно извлекает int из callback_data. Возвращает None при ошибке."""
     try:
         return int(data.split(":")[pos])
     except (IndexError, ValueError):
@@ -297,10 +329,16 @@ def safe_cb_int(data: str, pos: int = 1) -> Optional[int]:
 
 
 def calc_ref_bonus_days(tariff_days: int) -> int:
+    """Считает бонусные дни реферала: REF_BONUS_PERCENT% от купленного тарифа, минимум 1 день."""
     return max(1, round(tariff_days * get_ref_bonus_pct() / 100))
 
 
 def deactivate_user(conn, tg_id: int, source: str = "manual") -> None:
+    """
+    Единая функция деактивации пользователя в БД.
+    Обнуляет proxy_user/pass/subscription_end, сбрасывает флаги, пишет историю.
+    Вызывать внутри открытого with get_db() as conn.
+    """
     row = conn.execute(
         "SELECT proxy_user, subscription_end FROM users WHERE tg_id=?", (tg_id,)
     ).fetchone()
@@ -337,7 +375,7 @@ def _col_exists(conn, table: str, column: str) -> bool:
 
 def _run_init_db():
     with get_db() as conn:
-        # journal_mode=WAL уже устанавливается в get_db(), здесь дублирование не нужно
+        conn.execute("PRAGMA journal_mode=WAL")
 
         conn.execute("""CREATE TABLE IF NOT EXISTS users (
             tg_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, last_name TEXT,
@@ -349,10 +387,6 @@ def _run_init_db():
             onboarded BOOLEAN DEFAULT 0,
             notified_1d BOOLEAN DEFAULT 0, notified_3d BOOLEAN DEFAULT 0,
             notified_remind BOOLEAN DEFAULT 0,
-            concurrent_sessions INTEGER DEFAULT 0,
-            last_session_check TIMESTAMP,
-            session_warn_count INTEGER DEFAULT 0,
-            session_blocked_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
@@ -385,6 +419,7 @@ def _run_init_db():
             panel_added BOOLEAN DEFAULT 0
         )""")
 
+        # ── Тарифы в БД ──────────────────────────────────────────────────────
         conn.execute("""CREATE TABLE IF NOT EXISTS tariffs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             days INTEGER UNIQUE NOT NULL,
@@ -478,6 +513,7 @@ def _run_init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
 
+        # Индексы
         for idx in [
             "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)",
             "CREATE INDEX IF NOT EXISTS idx_users_proxy ON users(proxy_user)",
@@ -486,6 +522,7 @@ def _run_init_db():
         ]:
             conn.execute(idx)
 
+        # Миграции (идемпотентные)
         migrations = {
             "users.is_approved":      "ALTER TABLE users ADD COLUMN is_approved BOOLEAN DEFAULT 1",
             "users.onboarded":        "ALTER TABLE users ADD COLUMN onboarded BOOLEAN DEFAULT 0",
@@ -508,6 +545,7 @@ def _run_init_db():
             if not _col_exists(conn, tbl, c):
                 conn.execute(sql)
 
+        # Заполняем реквизиты по умолчанию если пусто
         defaults = {
             "phone": PAYMENT_PHONE,
             "bank":  PAYMENT_BANK,
@@ -516,20 +554,23 @@ def _run_init_db():
         for k, v in defaults.items():
             conn.execute("INSERT OR IGNORE INTO pay_settings (key, value) VALUES (?,?)", (k, v))
 
+        # Настройки бота по умолчанию
         bot_defaults = {
             "trial_hours":          str(TRIAL_HOURS),
             "ref_bonus_pct":        str(REF_BONUS_PERCENT),
             "notify_new_user":      "1",
             "welcome_text":         "",
             "maintenance":          "0",
-            "ref_min_tariff_days":  "30",
-            "ref_account_age_days": "2",
-            "ref_max_bonus_month":  "30",
-            "ref_first_only":       "1",
+            # Реферальная антинакрутка
+            "ref_min_tariff_days":  "30",   # минимальный тариф для начисления бонуса
+            "ref_account_age_days": "2",    # аккаунт реферала должен быть старше N дней
+            "ref_max_bonus_month":  "30",   # максимум бонусных дней рефереру в месяц
+            "ref_first_only":       "1",    # 1 = бонус только за первую оплату реферала
         }
         for k, v in bot_defaults.items():
             conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?,?)", (k, v))
 
+        # Заполняем тарифы по умолчанию если таблица пустая
         if not conn.execute("SELECT 1 FROM tariffs LIMIT 1").fetchone():
             for i, (days, price) in enumerate(DEFAULT_TARIFFS.items()):
                 conn.execute(
@@ -537,11 +578,16 @@ def _run_init_db():
                     (days, price, i),
                 )
 
+        # ── Бэкфилл для существующих пользователей ───────────────────────────
+        # 1) Уже подключённые клиенты (proxy_user есть) — помечаем onboarded=1,
+        #    чтобы они не получили онбординг при следующем продлении
         conn.execute(
             "UPDATE users SET onboarded=1 "
             "WHERE proxy_user IS NOT NULL AND onboarded=0"
         )
 
+        # 2) Восстанавливаем last_tariff_days из истории подписок:
+        #    берём последний платёж каждого пользователя (source LIKE 'payment:%')
         conn.execute("""
             UPDATE users SET last_tariff_days = (
                 SELECT sh.days FROM subscription_history sh
@@ -568,6 +614,7 @@ async def init_db():
 
 
 def get_tariffs() -> dict[int, int]:
+    """Загружает активные тарифы из БД."""
     try:
         with get_db() as conn:
             rows = conn.execute(
@@ -578,6 +625,7 @@ def get_tariffs() -> dict[int, int]:
         return DEFAULT_TARIFFS
 
 def get_pay_settings() -> dict:
+    """Загружает реквизиты оплаты из БД."""
     try:
         with get_db() as conn:
             rows = conn.execute("SELECT key, value FROM pay_settings").fetchall()
@@ -605,6 +653,7 @@ def is_admin(tg_id: int) -> bool:
 
 
 def get_setting(key: str, default: str = "") -> str:
+    """Читает динамическую настройку бота из БД."""
     try:
         with get_db() as conn:
             r = conn.execute("SELECT value FROM bot_settings WHERE key=?", (key,)).fetchone()
@@ -637,192 +686,185 @@ def get_ref_bonus_pct() -> float:
         return REF_BONUS_PERCENT
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NAIVEPROXY PANEL CLIENT (LocalPanelClient - работа с файлами напрямую)
+#  NAIVEPROXY PANEL CLIENT
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  КЛИЕНТ ПАНЕЛИ (LOCAL FILE-BASED)
+#  Работает напрямую с config.json, без HTTP API
+# ══════════════════════════════════════════════════════════════════════════════
+
+PANEL_CONFIG_PATH = "/opt/naiveproxy-panel/panel/data/config.json"
+CADDY_CONFIG_PATH = "/etc/caddy/Caddyfile"
+
 class LocalPanelClient:
     """
-    Клиент для работы с NaiveProxy Panel через прямое редактирование файлов.
-    Панель "NaiveProxy Panel by RIXXX" не имеет публичного HTTP API,
-    поэтому мы работаем напрямую с config.json и вызываем caddy reload.
+    Клиент для работы с NaiveProxy панелью через прямое редактирование файлов.
+    Панель RIXXX не имеет публичного HTTP API, поэтому работаем с config.json напрямую.
     """
-    
     def __init__(self):
-        self.config_path = "/opt/naiveproxy-panel/panel/data/config.json"
-        self.caddy_config_path = "/etc/caddy/Caddyfile"
-        self._file_lock = asyncio.Lock()  # Lock для защиты от race condition при записи
-    
+        self._file_lock: Optional[asyncio.Lock] = None
+        self.last_error = ""
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        if self._file_lock is None:
+            self._file_lock = asyncio.Lock()
+        return self._file_lock
+
     async def login(self) -> bool:
-        """
-        Всегда возвращает True, так как мы работаем локально на одном сервере.
-        Авторизация не требуется.
-        """
-        logger.info("✅ LocalPanelClient: авторизация не требуется (локальный доступ)")
+        """Авторизация не требуется — мы работаем с файлами локально от root."""
         return True
-    
-    async def _read_config_async(self) -> dict:
-        """Асинхронное чтение config.json через asyncio.to_thread"""
-        def read_sync():
-            with open(self.config_path, 'r', encoding='utf-8') as f:
+
+    async def ping(self) -> tuple[bool, str]:
+        """Проверка доступности конфигурационного файла панели."""
+        try:
+            if os.path.exists(PANEL_CONFIG_PATH):
+                with open(PANEL_CONFIG_PATH, 'r') as f:
+                    json.load(f)
+                return True, "Config file OK"
+            else:
+                return False, f"Config file not found: {PANEL_CONFIG_PATH}"
+        except json.JSONDecodeError as e:
+            return False, f"Invalid JSON: {e}"
+        except Exception as e:
+            return False, str(e)
+
+    async def _read_config(self) -> dict:
+        """Асинхронное чтение конфига."""
+        loop = asyncio.get_running_loop()
+        def _read():
+            with open(PANEL_CONFIG_PATH, 'r') as f:
                 return json.load(f)
-        return await asyncio.to_thread(read_sync)
-    
-    async def _write_config_async(self, data: dict) -> None:
-        """
-        Атомарная запись config.json: пишем во временный файл, затем rename.
-        Это защищает от повреждения данных при сбое питания или crash.
-        """
-        def write_sync():
-            tmp_path = self.config_path + ".tmp"
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            os.rename(tmp_path, self.config_path)
-        await asyncio.to_thread(write_sync)
-    
-    async def _reload_caddy(self) -> bool:
-        """Выполняет команду caddy reload для применения изменений"""
+        return await loop.run_in_executor(None, _read)
+
+    async def _write_config(self, config: dict):
+        """Атомарная запись конфига + caddy reload."""
+        loop = asyncio.get_running_loop()
+        def _write():
+            tmp_path = PANEL_CONFIG_PATH + ".tmp"
+            with open(tmp_path, 'w') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, PANEL_CONFIG_PATH)
+        await loop.run_in_executor(None, _write)
+        await self._reload_caddy()
+
+    async def _reload_caddy(self):
+        """Выполняет caddy reload."""
         try:
             process = await asyncio.create_subprocess_exec(
-                "caddy", "reload", "--config", self.caddy_config_path,
+                "caddy", "reload", "--config", CADDY_CONFIG_PATH,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, stderr = await process.communicate()
+            stdout, stderr = await process.communicate(timeout=10)
             if process.returncode == 0:
-                logger.info("✅ Caddy reload выполнен успешно")
-                return True
+                logger.info("✅ Caddy reload successful")
             else:
-                logger.error(f"❌ Caddy reload failed: {stderr.decode('utf-8', errors='replace')}")
-                return False
-        except FileNotFoundError:
-            logger.error("❌ Caddy binary not found at /usr/bin/caddy")
-            return False
+                logger.error(f"❌ Caddy reload failed: {stderr.decode()}")
+                self.last_error = stderr.decode()
         except Exception as e:
-            logger.exception(f"❌ Ошибка при reload Caddy: {e}")
-            return False
-    
-    async def ping(self) -> tuple[bool, str]:
-        """
-        Проверяет существование файла конфига панели.
-        Возвращает (True, "OK") если файл существует, иначе (False, ошибка).
-        """
-        exists = await asyncio.to_thread(os.path.exists, self.config_path)
-        if exists:
-            return True, "Конфигурационный файл доступен"
-        return False, f"Файл конфигурации не найден: {self.config_path}"
-    
-    async def list_users(self) -> List[dict]:
-        """
-        Читает config.json и возвращает список пользователей из массива proxyUsers.
-        """
-        async with self._file_lock:
+            logger.error(f"❌ Caddy reload error: {e}")
+            self.last_error = str(e)
+
+    async def add_user(self, username: str, password: str, expires_at: Optional[str] = None) -> bool:
+        """Добавить пользователя в панель через config.json."""
+        async with self._lock:
             try:
-                config = await self._read_config_async()
-                users = config.get("proxyUsers", [])
-                logger.info(f"📋 Получено {len(users)} пользователей из панели")
-                return users
-            except FileNotFoundError:
-                logger.error(f"❌ Файл конфигурации не найден: {self.config_path}")
-                return []
-            except json.JSONDecodeError as e:
-                logger.error(f"❌ Ошибка парсинга JSON: {e}")
-                return []
-            except Exception as e:
-                logger.exception(f"❌ Ошибка при чтении пользователей: {e}")
-                return []
-    
-    async def add_user(self, username: str, password: str) -> bool:
-        """
-        Добавляет пользователя в массив proxyUsers config.json.
-        Если пользователь уже существует — возвращает True (идемпотентность).
-        После добавления выполняет caddy reload.
-        """
-        async with self._file_lock:
-            try:
-                config = await self._read_config_async()
+                config = await self._read_config()
+                if "naiveUsers" not in config:
+                    config["naiveUsers"] = []
+                if "proxyUsers" not in config:
+                    config["proxyUsers"] = []
                 
-                # Проверяем是否存在 дубликата
-                users = config.get("proxyUsers", [])
-                for user in users:
-                    if user.get("username") == username:
-                        logger.info(f"✅ Пользователь {username} уже существует в панели — OK")
-                        return True
+                user_exists = any(u.get("username") == username for u in config["naiveUsers"])
+                created_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
                 
-                # Добавляем нового пользователя
-                new_user = {
-                    "username": username,
-                    "password": password
-                }
-                users.append(new_user)
-                config["proxyUsers"] = users
-                
-                # Атомарно записываем файл
-                await self._write_config_async(config)
-                logger.info(f"✅ Пользователь {username} добавлен в config.json")
-                
-                # Перезагружаем Caddy для применения изменений
-                reload_ok = await self._reload_caddy()
-                if not reload_ok:
-                    logger.warning("⚠️ Пользователь добавлен, но Caddy reload не удался!")
-                return reload_ok
-                
-            except FileNotFoundError:
-                logger.error(f"❌ Файл конфигурации не найден: {self.config_path}")
-                return False
-            except json.JSONDecodeError as e:
-                logger.error(f"❌ Ошибка парсинга JSON: {e}")
-                return False
-            except Exception as e:
-                logger.exception(f"❌ Ошибка при добавлении пользователя {username}: {e}")
-                return False
-    
-    async def delete_user(self, username: str) -> bool:
-        """
-        Удаляет пользователя из массива proxyUsers config.json.
-        Если пользователь не найден — возвращает True (идемпотентность).
-        После удаления выполняет caddy reload.
-        """
-        async with self._file_lock:
-            try:
-                config = await self._read_config_async()
-                users = config.get("proxyUsers", [])
-                
-                # Ищем и удаляем пользователя
-                original_len = len(users)
-                users = [u for u in users if u.get("username") != username]
-                
-                if len(users) == original_len:
-                    logger.info(f"ℹ️ Пользователь {username} не найден в панели — ничего не удаляем")
+                if not user_exists:
+                    naive_user = {"username": username, "password": password, "createdAt": created_at}
+                    if expires_at:
+                        naive_user["expiresAt"] = expires_at
+                    config["naiveUsers"].append(naive_user)
+                    
+                    proxy_user = {"username": username, "password": password}
+                    config["proxyUsers"].append(proxy_user)
+                    
+                    await self._write_config(config)
+                    logger.info(f"✅ Пользователь {username} добавлен в панель")
                     return True
-                
-                config["proxyUsers"] = users
-                
-                # Атомарно записываем файл
-                await self._write_config_async(config)
-                logger.info(f"✅ Пользователь {username} удалён из config.json")
-                
-                # Перезагружаем Caddy для применения изменений
-                reload_ok = await self._reload_caddy()
-                if not reload_ok:
-                    logger.warning("⚠️ Пользователь удалён, но Caddy reload не удался!")
-                return reload_ok
-                
-            except FileNotFoundError:
-                logger.error(f"❌ Файл конфигурации не найден: {self.config_path}")
+                else:
+                    # Обновляем expiresAt если пользователь существует
+                    for u in config["naiveUsers"]:
+                        if u.get("username") == username and expires_at:
+                            u["expiresAt"] = expires_at
+                            break
+                    await self._write_config(config)
+                    logger.info(f"✅ Пользователь {username} обновлён в панели")
+                    return True
+            except Exception as e:
+                self.last_error = str(e)
+                logger.error(f"❌ Ошибка добавления {username}: {e}")
                 return False
-            except json.JSONDecodeError as e:
-                logger.error(f"❌ Ошибка парсинга JSON: {e}")
+
+    async def update_user_expiry(self, username: str, expires_at: str) -> bool:
+        """Обновить дату истечения подписки."""
+        async with self._lock:
+            try:
+                config = await self._read_config()
+                for u in config.get("naiveUsers", []):
+                    if u.get("username") == username:
+                        u["expiresAt"] = expires_at
+                        await self._write_config(config)
+                        logger.info(f"✅ Обновлено время истечения для {username}")
+                        return True
+                logger.warning(f"⚠️ {username} не найден для обновления")
                 return False
             except Exception as e:
-                logger.exception(f"❌ Ошибка при удалении пользователя {username}: {e}")
+                self.last_error = str(e)
+                logger.error(f"❌ Ошибка обновления {username}: {e}")
                 return False
-    
+
+    async def delete_user(self, username: str) -> bool:
+        """Удалить пользователя из панели."""
+        async with self._lock:
+            try:
+                config = await self._read_config()
+                config["naiveUsers"] = [u for u in config.get("naiveUsers", []) if u.get("username") != username]
+                config["proxyUsers"] = [u for u in config.get("proxyUsers", []) if u.get("username") != username]
+                await self._write_config(config)
+                logger.info(f"✅ {username} удалён из панели")
+                return True
+            except Exception as e:
+                self.last_error = str(e)
+                logger.error(f"❌ Ошибка удаления {username}: {e}")
+                return False
+
+    async def list_users(self) -> List[dict]:
+        """Получить список пользователей."""
+        try:
+            config = await self._read_config()
+            users = []
+            for u in config.get("naiveUsers", []):
+                users.append({
+                    "username": u.get("username", ""),
+                    "password": u.get("password", ""),
+                    "expiresAt": u.get("expiresAt"),
+                    "createdAt": u.get("createdAt")
+                })
+            logger.info(f"📋 Получено {len(users)} пользователей")
+            return users
+        except Exception as e:
+            self.last_error = str(e)
+            logger.error(f"❌ Ошибка списка пользователей: {e}")
+            return []
+
     async def aclose(self):
-        """Закрытие ресурсов (для совместимости со старым интерфейсом)"""
         pass
 
 
-# Создаём глобальный экземпляр клиента
 panel = LocalPanelClient()
+panel = NaivePanelClient()
+
+# Трекер недоступности панели (для health-check алертов)
 _panel_down_since: Optional[float] = None
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -851,6 +893,7 @@ class SimpleDiskStorage(MemoryStorage):
         return self._alock
 
     def _persist_sync(self, key):
+        """Синхронная запись состояния в SQLite (вызывается через run_in_executor)."""
         self._conn.execute(
             "INSERT OR REPLACE INTO fsm_states (key, value) VALUES (?, ?)",
             (str(key), json.dumps(self.storage.get(str(key), {}), default=str)),
@@ -863,6 +906,7 @@ class SimpleDiskStorage(MemoryStorage):
 
     async def set_state(self, key, state=None):
         res = await super().set_state(key, state)
+        # Записываем timestamp для TTL-очистки
         str_key = str(key)
         if str_key in self.storage:
             self.storage[str_key]["__fsm_ts__"] = time.time()
@@ -893,30 +937,36 @@ class PaymentFSM(StatesGroup):
 
 class AdminFSM(StatesGroup):
     broadcast        = State()
-    broadcast_filter = State()
+    broadcast_filter = State()   # выбор аудитории рассылки
     extend_user      = State()
     extend_days      = State()
     adduser_tg_id    = State()
     create_poll      = State()
     poll_options     = State()
+    # Тарифы
     tariff_add_days   = State()
     tariff_add_price  = State()
     tariff_add_label  = State()
     tariff_edit_id    = State()
     tariff_edit_field = State()
     tariff_edit_value = State()
+    # Промокоды
     promo_add_code    = State()
     promo_add_discount = State()
     promo_add_uses    = State()
     promo_add_days    = State()
+    # Поддержка — ответ
     reply_ticket_uid  = State()
     reply_ticket_text = State()
+    # Поиск
     search_query      = State()
+    # Настройки оплаты
     pay_settings_field = State()
     pay_settings_value = State()
+    # Бан
     ban_uid           = State()
+    # Импорт с панели
     link_tg_id        = State()
-    subtract_days     = State()
 
 
 class SupportFSM(StatesGroup):
@@ -1036,6 +1086,7 @@ async def cmd_start(msg: Message, state: FSMContext):
         )
         conn.commit()
 
+    # Уведомление админа о новом пользователе
     if is_new and get_setting("notify_new_user", "1") == "1":
         name = f"{msg.from_user.first_name or ''} (@{msg.from_user.username or '—'})"
         notif_text = f"👤 <b>Новый пользователь!</b>\n{name}\n🆔 <code>{tg_id}</code>"
@@ -1072,6 +1123,9 @@ async def cmd_my_sub(msg: Message):
     if user and user["proxy_user"] and user["is_active"]:
         d = days_left(user["subscription_end"])
 
+        # Если подписка истекла (0 дней) — запускаем проверку панели фоново,
+        # а пользователю сразу показываем актуальный статус из БД.
+        # Тяжёлый panel.list_users() не вызывается inline — только через /check_user или планировщик.
         if d == 0 or not user["subscription_end"]:
             async def _bg_panel_check(tg_id=tg_id, u=user):
                 panel_users = await panel.list_users()
@@ -1333,6 +1387,7 @@ async def cb_approve(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return await cb.answer("⛔", show_alert=True)
     p_id = safe_cb_int(cb.data, 1)
     if p_id is None: return await cb.answer("❌ Некорректные данные", show_alert=True)
+    # Атомарно переводим в processing — защита от двойного подтверждения
     with get_db() as conn:
         upd = conn.execute(
             "UPDATE payments SET status='processing', panel_updated=0, updated_at=CURRENT_TIMESTAMP "
@@ -1378,6 +1433,7 @@ async def cb_approve(cb: CallbackQuery):
                     "updated_at=CURRENT_TIMESTAMP WHERE id=?", (p_id,),
                 )
                 conn.commit()
+            # Реф. бонус — логика антинакрутки внутри _apply_ref_bonus
             if u and u["referred_by"]:
                 await _apply_ref_bonus(u["referred_by"], tg_id, days, p_id)
             key = make_naive_key(proxy_user, proxy_pass)
@@ -1428,6 +1484,7 @@ async def cb_approve(cb: CallbackQuery):
                 f"👤 Логин: <code>{proxy_user}</code>\n\n"
                 f"🔑 Ключ:\n<code>{key}</code>",
             ))
+            # Онбординг — пошаговая инструкция под платформу
             fire_and_forget(_send_onboarding(tg_id))
         await cb.message.edit_text(cb.message.text + "\n\n✅ <b>ОДОБРЕНО</b>")
     except Exception as e:
@@ -1458,6 +1515,16 @@ async def cb_reject(cb: CallbackQuery):
 #  РЕФЕРАЛЬНАЯ СИСТЕМА
 # ══════════════════════════════════════════════════════════════════════════════
 async def _apply_ref_bonus(ref_id: int, referred_tg_id: int, tariff_days: int, payment_id: int):
+    """
+    Начисляет реферальный бонус с защитой от накрутки.
+
+    Проверки (все настраиваются через ⚙️ Настройки бота):
+    1. ref_first_only=1    → бонус только за первую оплату реферала
+    2. ref_min_tariff_days → тариф должен быть не короче N дней
+    3. ref_account_age_days→ аккаунт реферала должен быть старше N дней
+    4. ref_max_bonus_month → реферер не может получить > N бонусных дней в месяц
+    """
+    # ── читаем настройки ──────────────────────────────────────────────────────
     first_only       = get_setting("ref_first_only",       "1") == "1"
     min_tariff       = int(get_setting("ref_min_tariff_days",  "30") or 0)
     min_age_days     = int(get_setting("ref_account_age_days", "2")  or 0)
@@ -1469,6 +1536,7 @@ async def _apply_ref_bonus(ref_id: int, referred_tg_id: int, tariff_days: int, p
         if not ref or not referred:
             return
 
+        # ── Защита 1: только первая оплата ───────────────────────────────────
         if first_only:
             already = conn.execute(
                 "SELECT 1 FROM referrals WHERE referrer_id=? AND referred_id=? AND payment_count > 0",
@@ -1478,10 +1546,12 @@ async def _apply_ref_bonus(ref_id: int, referred_tg_id: int, tariff_days: int, p
                 logger.debug(f"ref_bonus skip: not first payment ref={ref_id} referred={referred_tg_id}")
                 return
 
+        # ── Защита 2: минимальный тариф ──────────────────────────────────────
         if min_tariff and tariff_days < min_tariff:
             logger.debug(f"ref_bonus skip: tariff {tariff_days}d < min {min_tariff}d")
             return
 
+        # ── Защита 3: возраст аккаунта реферала ──────────────────────────────
         if min_age_days:
             created_at = parse_datetime(referred["created_at"])
             if created_at:
@@ -1492,6 +1562,7 @@ async def _apply_ref_bonus(ref_id: int, referred_tg_id: int, tariff_days: int, p
                     )
                     return
 
+        # ── Защита 4: месячный лимит для реферера ────────────────────────────
         bonus_days = calc_ref_bonus_days(tariff_days)
         if max_bonus_month:
             month_start = datetime.now(TZ).date().replace(day=1).isoformat()
@@ -1506,10 +1577,12 @@ async def _apply_ref_bonus(ref_id: int, referred_tg_id: int, tariff_days: int, p
                     f"(max={max_bonus_month}d)"
                 )
                 return
+            # Обрезаем бонус чтобы не превысить лимит
             bonus_days = min(bonus_days, max_bonus_month - month_given)
             if bonus_days <= 0:
                 return
 
+        # ── Начисляем ─────────────────────────────────────────────────────────
         has_proxy = bool(ref["proxy_user"])
         cur     = parse_date(ref["subscription_end"]) if ref["subscription_end"] else datetime.now(TZ).date()
         new_ref = (max(cur, datetime.now(TZ).date()) + timedelta(days=bonus_days)).strftime("%Y-%m-%d")
@@ -1587,6 +1660,7 @@ async def show_refs(msg: Message):
         if not min_tariff or d >= min_tariff
     ])
 
+    # Сколько бонусов уже получено в этом месяце
     month_start = datetime.now(TZ).date().replace(day=1).isoformat()
     with get_db() as conn:
         month_given = conn.execute(
@@ -1628,44 +1702,6 @@ async def show_refs(msg: Message):
     await msg.answer(text)
 
 
-@dp.callback_query(F.data == "my_ref_link")
-@handle_errors()
-async def show_my_ref_link(cb: CallbackQuery):
-    """Показывает реферальную ссылку пользователя при нажатии кнопки из напоминания"""
-    if is_banned(cb.from_user.id): return
-    tg_id = cb.from_user.id
-    code = ensure_ref_code(tg_id)
-    bot_info = await bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start=ref_{code}"
-    
-    with get_db() as conn:
-        cnt = conn.execute(
-            "SELECT COUNT(*) FROM users WHERE referred_by=?", (tg_id,)
-        ).fetchone()[0]
-        total_bonus = conn.execute(
-            "SELECT COALESCE(ref_balance, 0) FROM users WHERE tg_id=?", (tg_id,)
-        ).fetchone()[0]
-    
-    text = (
-        f"👥 <b>Ваша реферальная ссылка:</b>\\n\\n"
-        f"<code>{link}</code>\\n\\n"
-        f"📊 <b>Ваша статистика:</b>\\n"
-        f"  Приглашено: <b>{cnt}</b> чел.\\n"
-        f"  Бонусов на балансе: <b>{total_bonus} дн.</b>\\n\\n"
-        f"💰 Приглашай друзей и получай <b>+{get_ref_bonus_pct():.0f}% дней</b> за каждую оплату!\\n"
-        f"Жми «👥 Рефералы» в главном меню для подробностей."
-    )
-    
-    await cb.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Подробнее", callback_data="noop")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="noop")],
-        ])
-    )
-    await cb.answer()
-
-
 # ── HISTORY ──────────────────────────────────────────────────────────────────
 @dp.message(F.text == "🧾 История")
 @handle_errors()
@@ -1691,6 +1727,7 @@ async def show_history(msg: Message):
 @dp.callback_query(F.data == "support")
 @handle_errors()
 async def cb_support_shortcut(cb: CallbackQuery, state: FSMContext):
+    """Быстрый переход в поддержку из inline-кнопки."""
     await cb.answer()
     if is_banned(cb.from_user.id):
         return await cb.message.answer("🚫 Ваш аккаунт заблокирован.")
@@ -1738,7 +1775,7 @@ async def cb_vote(cb: CallbackQuery):
 @handle_errors()
 async def support_start(msg: Message, state: FSMContext):
     if is_banned(msg.from_user.id): return await msg.answer("🚫 Ваш аккаунт заблокирован.")
-    if not rate_limiter.allow(msg.from_user.id, 30.0):
+    if not rate_limiter.allow(msg.from_user.id, 30.0):  # не чаще раза в 30 сек
         return await msg.answer("⏳ Пожалуйста, подождите немного перед новым обращением.")
     await state.set_state(SupportFSM.waiting)
     await msg.answer("💬 Опишите вашу проблему:", reply_markup=kb_cancel())
@@ -2037,6 +2074,7 @@ async def _apply_promo(msg: Message, tg_id: int, code: str):
             old_end = (u["subscription_end"] if u else None) or ""
             cur     = parse_date(old_end) or datetime.now(TZ).date()
             new_end = (max(cur, datetime.now(TZ).date()) + timedelta(days=p["bonus_days"])).strftime("%Y-%m-%d")
+            # Продлеваем дату; is_active=1 только если proxy_user уже есть
             has_proxy = bool(u and u["proxy_user"])
             if has_proxy:
                 conn.execute(
@@ -2143,6 +2181,7 @@ async def cmd_profile(msg: Message):
 @handle_errors()
 async def admin_ban_menu(msg: Message, state: FSMContext):
     if not is_admin(msg.from_user.id): return
+    # Показываем текущий список забаненных
     with get_db() as conn:
         rows = conn.execute(
             "SELECT tg_id, username, first_name FROM users WHERE is_banned=1 ORDER BY tg_id"
@@ -2171,6 +2210,7 @@ async def admin_ban_do(msg: Message, state: FSMContext):
         if not u: return await msg.answer(f"❌ Пользователь <code>{tg_id}</code> не найден.")
         new_ban = 0 if u["is_banned"] else 1
         if new_ban:
+            # Бан: блокируем бот + деактивируем VPN + удаляем с панели
             conn.execute(
                 "UPDATE users SET is_banned=1, is_active=0, proxy_user=NULL, proxy_pass=NULL, "
                 "subscription_end=NULL, notified_1d=0, notified_3d=0, "
@@ -2183,9 +2223,11 @@ async def admin_ban_do(msg: Message, state: FSMContext):
                     (tg_id, "expire", 0, u["subscription_end"] or "", "", "admin_ban"),
                 )
         else:
+            # Разбан: только снимаем флаг, подписку не восстанавливаем
             conn.execute("UPDATE users SET is_banned=0 WHERE tg_id=?", (tg_id,))
         conn.commit()
 
+    # Удаляем с панели вне коннекта
     if new_ban and u["proxy_user"]:
         await panel.delete_user(u["proxy_user"])
 
@@ -2299,9 +2341,6 @@ async def admin_search_do(msg: Message, state: FSMContext):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="➕ Выдать тариф",      callback_data=f"admin_add:{u['tg_id']}:sel"),
-                InlineKeyboardButton(text="➖ Отнять дни",        callback_data=f"admin_subtract:{u['tg_id']}:sel"),
-            ],
-            [
                 InlineKeyboardButton(
                     text="🚫 Бан" if not u.get("is_banned") else "✅ Разбан",
                     callback_data=f"ban_toggle:{u['tg_id']}",
@@ -2312,6 +2351,7 @@ async def admin_search_do(msg: Message, state: FSMContext):
     )
 
 
+# Обработка "sel" - показать выбор тарифа
 @dp.callback_query(F.data.startswith("admin_add:") & F.data.endswith(":sel"))
 @handle_errors()
 async def cb_admin_add_select(cb: CallbackQuery):
@@ -2320,154 +2360,6 @@ async def cb_admin_add_select(cb: CallbackQuery):
     if tg_id is None: return await cb.answer("❌ Некорректные данные", show_alert=True)
     await cb.answer()
     await cb.message.answer(f"Выберите тариф для <code>{tg_id}</code>:", reply_markup=kb_tariffs_admin(tg_id))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ОТНЯТЬ ДНИ У ПОЛЬЗОВАТЕЛЯ (ADMIN SUBTRACT DAYS)
-# ══════════════════════════════════════════════════════════════════════════════
-
-@dp.callback_query(F.data.startswith("admin_subtract:") & F.data.endswith(":sel"))
-@handle_errors()
-async def cb_admin_subtract_select(cb: CallbackQuery, state: FSMContext):
-    """Выбор количества дней для отнимания у пользователя."""
-    if not is_admin(cb.from_user.id): return await cb.answer("⛔", show_alert=True)
-    tg_id = safe_cb_int(cb.data, 1)
-    if tg_id is None: return await cb.answer("❌ Некорректные данные", show_alert=True)
-    await cb.answer()
-    # Сохраняем tg_id в состояние для последующего использования
-    await state.update_data(subtract_tg_id=tg_id)
-    await state.set_state(AdminFSM.subtract_days)
-    await cb.message.answer(
-        f"➖ <b>Отнять дни у пользователя {tg_id}</b>\n\n"
-        f"Введите количество дней для отнимания:",
-        reply_markup=kb_cancel(),
-    )
-
-
-@dp.message(AdminFSM.subtract_days)
-@handle_errors()
-async def admin_subtract_days(msg: Message, state: FSMContext):
-    """Обработка ввода количества дней и выполнение отнимания."""
-    if msg.text == "🏠 Главное меню":
-        await state.clear()
-        return await cmd_home(msg, state)
-    if msg.text.lower() in ("отмена", "cancel"):
-        await state.clear()
-        return await msg.answer("❌ Отменено.", reply_markup=kb_admin())
-    
-    # Проверяем что введено число
-    if not msg.text.strip().lstrip('-').isdigit():
-        return await msg.answer("❌ Введите корректное число дней (например: 5 или -3).")
-    
-    days_to_subtract = int(msg.text.strip())
-    
-    # Дни должны быть положительным числом (мы отнимаем это количество)
-    if days_to_subtract <= 0:
-        return await msg.answer("❌ Введите положительное количество дней для отнимания.")
-    
-    await state.clear()
-    
-    # Получаем ID пользователя из контекста (нужно сохранить ранее)
-    # В данном случае мы используем последний запрошенный tg_id из callback
-    # Для этого нам нужно получить tg_id из состояния или передать иначе
-    # Используем простой подход - парсим из предыдущего сообщения если есть
-    # Но лучше перепишем с использованием state
-    
-    # Получаем данные из состояния (tg_id нужно было сохранить)
-    data = await state.get_data()
-    tg_id = data.get("subtract_tg_id")
-    
-    if not tg_id:
-        return await msg.answer("❌ Ошибка: не найден пользователь. Попробуйте снова через поиск.")
-    
-    with get_db() as conn:
-        u = conn.execute(
-            "SELECT tg_id, first_name, username, subscription_end, is_active, proxy_user FROM users WHERE tg_id=?",
-            (tg_id,)
-        ).fetchone()
-        
-        if not u:
-            return await msg.answer(f"❌ Пользователь <code>{tg_id}</code> не найден.")
-        
-        cur_end = parse_date(u["subscription_end"]) if u["subscription_end"] else datetime.now(TZ).date()
-        
-        # Вычисляем новую дату окончания
-        new_end = cur_end - timedelta(days=days_to_subtract)
-        
-        # Если новая дата меньше текущей - подписка истекает
-        if new_end < datetime.now(TZ).date():
-            new_end_str = new_end.strftime("%Y-%m-%d")
-            # Деактивируем пользователя если подписка истекла
-            deactivate_user(conn, tg_id, source="admin_subtract_days")
-            action = "deactivated_by_subtract"
-        else:
-            new_end_str = new_end.strftime("%Y-%m-%d")
-            action = "subtract"
-        
-        # Обновляем запись в БД
-        conn.execute(
-            "UPDATE users SET subscription_end=?, is_active=? WHERE tg_id=?",
-            (new_end_str, 1 if new_end >= datetime.now(TZ).date() else 0, tg_id)
-        )
-        
-        # Записываем в историю
-        conn.execute(
-            "INSERT INTO subscription_history "
-            "(tg_id, action, days, old_end, new_end, source) VALUES (?,?,?,?,?,?)",
-            (tg_id, action, -days_to_subtract, u["subscription_end"] or "", new_end_str, "admin_manual_subtract")
-        )
-        conn.commit()
-    
-    # Если у пользователя есть proxy_user, проверяем не нужно ли удалить его из панели
-    panel_note = ""
-    if new_end < datetime.now(TZ).date() and u["proxy_user"]:
-        # Подписка истекла - удаляем из панели
-        if await panel.delete_user(u["proxy_user"]):
-            panel_note = "\n✅ Пользователь удалён из панели NaiveProxy."
-        else:
-            panel_note = f"\n⚠️ Не удалось удалить из панели: {safe_html(panel.last_error)}"
-        # Сбрасываем proxy данные в БД
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE users SET proxy_user=NULL, proxy_pass=NULL WHERE tg_id=?",
-                (tg_id,)
-            )
-            conn.commit()
-    
-    # Формируем сообщение
-    name = (u["first_name"] or str(tg_id)) + (f" (@{u['username']})" if u["username"] else "")
-    
-    if new_end < datetime.now(TZ).date():
-        result_text = (
-            f"➖ <b>Готово!</b>\n"
-            f"🆔 <code>{tg_id}</code> ({name})\n"
-            f"📅 Отнято дней: <b>{days_to_subtract}</b>\n"
-            f"📆 Подписка истекла: <b>{new_end_str}</b>\n"
-            f"🔴 Пользователь деактивирован.{panel_note}"
-        )
-        # Уведомляем пользователя
-        fire_and_forget(safe_send(
-            tg_id,
-            f"⚠️ <b>Администратор отнял {days_to_subtract} дн. от вашей подписки.</b>\n"
-            f"📆 Ваша подписка истекла: <b>{new_end_str}</b>\n"
-            f"🔒 Доступ к VPN прекращён."
-        ))
-    else:
-        result_text = (
-            f"➖ <b>Готово!</b>\n"
-            f"🆔 <code>{tg_id}</code> ({name})\n"
-            f"📅 Отнято дней: <b>{days_to_subtract}</b>\n"
-            f"📆 Новая дата окончания: <b>{new_end_str}</b>\n"
-            f"✅ Пользователь активен."
-        )
-        # Уведомляем пользователя
-        fire_and_forget(safe_send(
-            tg_id,
-            f"⚠️ <b>Администратор отнял {days_to_subtract} дн. от вашей подписки.</b>\n"
-            f"📆 Новая дата окончания: <b>{new_end_str}</b>"
-        ))
-    
-    await msg.answer(result_text, reply_markup=kb_admin())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2619,6 +2511,7 @@ async def admin_pay_settings_value(msg: Message, state: FSMContext):
 # ══════════════════════════════════════════════════════════════════════════════
 #  РАССЫЛКА С ФИЛЬТРОМ АУДИТОРИИ
 # ══════════════════════════════════════════════════════════════════════════════
+# ── BROADCAST ────────────────────────────────────────────────────────────────
 @dp.message(F.text == "📣 Рассылка")
 @handle_errors()
 async def admin_broad(msg: Message, state: FSMContext):
@@ -2697,6 +2590,7 @@ async def admin_broad_do(msg: Message, state: FSMContext):
                 fail += 1
             await asyncio.sleep(0.05)
 
+        # Пишем лог рассылки
         preview = (msg.text or msg.caption or "[медиа]")[:100]
         with get_db() as conn:
             conn.execute(
@@ -2755,6 +2649,7 @@ async def admin_tariffs(msg: Message):
     await msg.answer(_tariffs_text(), reply_markup=_tariffs_manage_kb())
 
 
+# Добавить тариф
 @dp.callback_query(F.data == "tariff_add")
 @handle_errors()
 async def cb_tariff_add(cb: CallbackQuery, state: FSMContext):
@@ -2816,6 +2711,7 @@ async def tariff_add_label(msg: Message, state: FSMContext):
         )
 
 
+# Редактировать тариф
 @dp.callback_query(F.data.startswith("te:"))
 @handle_errors()
 async def cb_tariff_edit(cb: CallbackQuery, state: FSMContext):
@@ -2869,6 +2765,7 @@ async def tariff_edit_value(msg: Message, state: FSMContext):
     t_id  = data["edit_tariff_id"]
     field = data["edit_field"]
     await state.clear()
+    # Whitelist полей во избежание SQL-инъекции
     ALLOWED_FIELDS = {"days", "price", "label"}
     if field not in ALLOWED_FIELDS:
         return await msg.answer("❌ Недопустимое поле.", reply_markup=kb_admin())
@@ -2890,6 +2787,7 @@ async def tariff_edit_value(msg: Message, state: FSMContext):
         await msg.answer(f"✅ Тариф <b>#{t_id}</b> обновлён.", reply_markup=kb_admin())
 
 
+# Переключить активность тарифа
 @dp.callback_query(F.data.startswith("tt:"))
 @handle_errors()
 async def cb_tariff_toggle(cb: CallbackQuery):
@@ -2903,6 +2801,7 @@ async def cb_tariff_toggle(cb: CallbackQuery):
     await cb.message.edit_text(_tariffs_text(), reply_markup=_tariffs_manage_kb())
 
 
+# Удалить тариф
 @dp.callback_query(F.data.startswith("td:"))
 @handle_errors()
 async def cb_tariff_delete(cb: CallbackQuery):
@@ -3026,10 +2925,12 @@ async def cmd_deluser(msg: Message):
     if not u:
         return await msg.answer(f"❌ Пользователь <code>{tg_id}</code> не найден.")
 
+    # Удаляем с панели если есть
     panel_ok = False
     if u["proxy_user"]:
         panel_ok = await panel.delete_user(u["proxy_user"])
 
+    # Полностью сбрасываем данные подписки в БД
     with get_db() as conn:
         deactivate_user(conn, tg_id, source="admin_delete")
         conn.commit()
@@ -3070,11 +2971,13 @@ async def admin_extend_got_user(msg: Message, state: FSMContext):
     await state.update_data(extend_tg_id=tg_id)
     await state.set_state(AdminFSM.extend_days)
 
+    # Быстрые кнопки тарифов + произвольное число
     tariffs = get_tariffs()
     quick   = [[
         InlineKeyboardButton(text=f"+{d} дн.", callback_data=f"ext_quick:{tg_id}:{d}")
         for d in sorted(tariffs.keys())
     ]]
+    # Дополнительные быстрые значения
     extra = [1, 3, 7, 14]
     quick.append([
         InlineKeyboardButton(text=f"+{d} дн.", callback_data=f"ext_quick:{tg_id}:{d}")
@@ -3125,6 +3028,7 @@ async def admin_extend_got_days(msg: Message, state: FSMContext):
 
 
 async def _do_extend(source, tg_id: int, days: int, edit: bool = False, source_label: str = "admin"):
+    """Общая логика продления — работает и для обычных, и для триальных пользователей."""
     with get_db() as conn:
         u     = conn.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
         trial = conn.execute(
@@ -3137,6 +3041,7 @@ async def _do_extend(source, tg_id: int, days: int, edit: bool = False, source_l
         else:    await source.answer(text, reply_markup=kb_admin())
         return
 
+    # Если в users нет proxy_user — берём из trials (триальный пользователь)
     proxy_user = u["proxy_user"]
     proxy_pass = u["proxy_pass"]
     if not proxy_user and trial:
@@ -3234,7 +3139,7 @@ async def admin_csv(msg: Message):
         for r in conn.execute("SELECT * FROM users").fetchall():
             w.writerow([
                 r["tg_id"], r["username"], r["first_name"], r["proxy_user"],
-                "***" if r["proxy_pass"] else "",
+                "***" if r["proxy_pass"] else "",  # не выгружаем пароли в открытом виде
                 r["subscription_end"], r["is_active"],
                 r["traffic_up"], r["traffic_down"], r["ref_balance"],
                 r["referred_by"], r["created_at"],
@@ -3250,76 +3155,47 @@ async def admin_csv(msg: Message):
 @handle_errors()
 async def cmd_test_panel(msg: Message):
     """
-    Тестирование панели NaiveProxy Panel by RIXXX.
-    Так как панель не имеет HTTP API, проверяем:
-    1. Доступность файла config.json
-    2. Права на выполнение caddy reload
+    Расширенная диагностика: пробует все варианты API и показывает сырой ответ.
+    Используй если approve возвращает 'Ошибка панели при создании пользователя'.
     """
     if not is_admin(msg.from_user.id): return
-    
+    await msg.answer("🔬 Тестирую API панели NaiveProxy...")
+
+    test_user = f"_test_{int(time.time())}"
+    test_pass = "testpass123"
+
     results = []
-    
-    # Проверка 1: существование файла конфигурации
-    config_path = "/opt/naiveproxy-panel/panel/data/config.json"
-    config_exists = await asyncio.to_thread(os.path.exists, config_path)
-    if config_exists:
-        results.append(f"✅ Файл конфигурации: <code>{config_path}</code> найден")
+    endpoints = [
+        ("POST", "/api/proxy-users/add",       {"username": test_user, "password": test_pass}),
+        ("POST", "/api/users",                  {"username": test_user, "password": test_pass}),
+        ("POST", "/api/proxy-users",            {"username": test_user, "password": test_pass}),
+        ("GET",  "/api/proxy-users/list",       None),
+        ("GET",  "/api/users",                  None),
+    ]
+
+    for method, path, body in endpoints:
         try:
-            # Проверяем читаемость и валидность JSON
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            users_count = len(config.get("proxyUsers", []))
-            results.append(f"✅ JSON валиден, пользователей: {users_count}")
-        except json.JSONDecodeError as e:
-            results.append(f"❌ Ошибка парсинга JSON: {safe_html(str(e))}")
-        except PermissionError:
-            results.append(f"❌ Нет прав на чтение файла")
-    else:
-        results.append(f"❌ Файл конфигурации не найден: <code>{config_path}</code>")
-    
-    # Проверка 2: доступность бинарника caddy
-    caddy_path = "/usr/bin/caddy"
-    caddy_exists = await asyncio.to_thread(os.path.exists, caddy_path)
-    if caddy_exists:
-        results.append(f"✅ Caddy binary: <code>{caddy_path}</code> найден")
-        # Проверяем исполняемость
-        if os.access(caddy_path, os.X_OK):
-            results.append("✅ Caddy имеет права на выполнение")
-        else:
-            results.append("❌ Caddy не имеет прав на выполнение (chmod +x)")
-    else:
-        results.append(f"❌ Caddy binary не найден: <code>{caddy_path}</code>")
-    
-    # Проверка 3: конфиг Caddyfile
-    caddy_config = "/etc/caddy/Caddyfile"
-    caddy_config_exists = await asyncio.to_thread(os.path.exists, caddy_config)
-    if caddy_config_exists:
-        results.append(f"✅ Caddyfile: <code>{caddy_config}</code> найден")
-    else:
-        results.append(f"❌ Caddyfile не найден: <code>{caddy_config}</code>")
-    
-    # Проверка 4: тестовый caddy reload (не применяем, только проверяем возможность)
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "caddy", "version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-        if process.returncode == 0:
-            version_info = stdout.decode('utf-8', errors='replace').strip()
-            results.append(f"✅ Caddy version: <code>{safe_html(version_info)}</code>")
-        else:
-            results.append(f"⚠️ Caddy version check failed: {safe_html(stderr.decode('utf-8', errors='replace')[:200])}")
-    except FileNotFoundError:
-        results.append("❌ Команда 'caddy' не найдена в PATH")
-    except Exception as e:
-        results.append(f"❌ Ошибка проверки Caddy: {safe_html(str(e))}")
-    
+            sess = panel._sess()
+            if not panel.logged_in:
+                await panel.login()
+            kwargs = {"json": body, "timeout": 5.0} if body else {"timeout": 5.0}
+            r = await getattr(sess, method.lower())(f"{PANEL_URL}{path}", **kwargs)
+            try:
+                resp_body = r.text[:200]
+            except Exception:
+                resp_body = "(не удалось прочитать тело)"
+            results.append(f"<code>{method} {path}</code>\n→ HTTP {r.status_code}: <code>{safe_html(resp_body)}</code>")
+        except Exception as e:
+            results.append(f"<code>{method} {path}</code>\n→ ❌ {safe_html(str(e)[:100])}")
+
+    # Попытка удалить тестового пользователя если создался
+    await panel.delete_user(test_user)
+
     await msg.answer(
-        "🔧 <b>Диагностика NaiveProxy Panel:</b>\n\n" +
-        "\n".join(results) +
-        "\n\n<i>Панель работает через прямое редактирование config.json и caddy reload.</i>",
+        "🔬 <b>Результаты теста API:</b>\n\n" +
+        "\n\n".join(results) +
+        "\n\n<b>Что искать:</b> найдите строку с HTTP 200 или 201 — это рабочий эндпоинт. "
+        "Сообщите разработчику какой именно path работает.",
         reply_markup=kb_admin()
     )
 
@@ -3328,30 +3204,19 @@ async def cmd_test_panel(msg: Message):
 @handle_errors()
 async def admin_diag(msg: Message):
     if not is_admin(msg.from_user.id): return
-    await msg.answer("🔍 Проверяю панель NaiveProxy Panel by RIXXX...")
-    
-    # Используем новый метод ping() из LocalPanelClient
+    await msg.answer("🔍 Проверяю подключение к панели NaiveProxy...")
     ok, detail = await panel.ping()
-    login_ok = await panel.login()
-    
-    panel_status = "✅ Конфигурация доступна" if ok else f"❌ Недоступна\n<i>{safe_html(detail)}</i>"
-    login_status = "✅ Локальный доступ OK" if login_ok else f"❌ Ошибка\n<i>{safe_html(str(detail))}</i>"
-    
-    # Дополнительная проверка Caddy
-    caddy_config = "/etc/caddy/Caddyfile"
-    caddy_exists = await asyncio.to_thread(os.path.exists, caddy_config)
-    caddy_status = "✅ Caddyfile найден" if caddy_exists else f"❌ Caddyfile не найден"
-    
+    login_ok   = await panel.login()
+    panel_status = "✅ Достижима" if ok else f"❌ Недоступна\n<i>{safe_html(detail)}</i>"
+    login_status = "✅ Авторизация успешна" if login_ok else f"❌ Ошибка авторизации\n<i>{safe_html(panel.last_error)}</i>"
     await msg.answer(
         f"🔧 <b>Диагностика панели</b>\n\n"
-        f"📡 Панель (LocalPanelClient): {panel_status}\n"
-        f"🔑 Авторизация: {login_status}\n"
-        f"⚙️  {caddy_status}\n\n"
-        f"<b>Если есть проблемы:</b>\n"
-        f"• Проверьте что панель установлена в /opt/naiveproxy-panel/\n"
-        f"• Проверьте права на файл config.json\n"
-        f"• Убедитесь что Caddy установлен и доступен",
-        reply_markup=kb_admin()
+        f"📡 Панель ({PANEL_URL}): {panel_status}\n"
+        f"🔑 Логин ({PANEL_USER}): {login_status}\n\n"
+        f"<b>Если панель недоступна:</b>\n"
+        f"• Проверьте что NaiveProxy запущен\n"
+        f"• Проверьте PANEL_URL в .env\n"
+        f"• Проверьте firewall/порты"
     )
 
 
@@ -3362,15 +3227,21 @@ async def cleanup_stale_fsm():
     """
     Сбрасывает FSM-состояния которые висят дольше 30 минут.
     Защищает от ситуации когда пользователь начал диалог и бросил.
-    
-    В aiogram 3.x структура MemoryStorage изменилась, и прямой доступ к 
-    внутреннему хранилищу невозможен. Фреймворк сам управляет временем жизни
-    состояний, поэтому эта функция теперь только логирует выполнение проверки.
     """
     try:
-        # В aiogram 3.x MemoryStorage не предоставляет прямого доступа к storage dict
-        # Реальную очистку устаревших состояний выполняет сам фреймворк
-        logger.debug("🧹 Проверка устаревших FSM-состояний выполнена (очистка на стороне фреймворка)")
+        storage = dp.storage
+        if not hasattr(storage, "storage"):
+            return
+        stale_keys = []
+        now = time.time()
+        for key, data in list(storage.storage.items()):
+            ts = data.get("__fsm_ts__", 0)
+            if ts and (now - ts) > 1800:  # 30 минут
+                stale_keys.append(key)
+        for key in stale_keys:
+            storage.storage.pop(key, None)
+        if stale_keys:
+            logger.info(f"🧹 Очищено {len(stale_keys)} устаревших FSM-состояний")
     except Exception as e:
         logger.warning(f"cleanup_stale_fsm error: {e}")
 
@@ -3412,6 +3283,7 @@ async def remind_pending_payments():
 @dp.callback_query(F.data == "open_support")
 @handle_errors()
 async def cb_open_support(cb: CallbackQuery, state: FSMContext):
+    """Быстрый переход к поддержке из напоминалки."""
     await cb.answer()
     if is_banned(cb.from_user.id):
         return await cb.message.answer("🚫 Ваш аккаунт заблокирован.")
@@ -3425,6 +3297,10 @@ async def cb_open_support(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("quick_renew:"))
 @handle_errors()
 async def cb_quick_renew(cb: CallbackQuery):
+    """
+    Создаёт платёж сразу на предыдущий тариф пользователя без выбора тарифа.
+    callback_data = quick_renew:{days}
+    """
     if is_banned(cb.from_user.id):
         return await cb.answer("🚫 Ваш аккаунт заблокирован.", show_alert=True)
     days = safe_cb_int(cb.data, 1)
@@ -3432,6 +3308,7 @@ async def cb_quick_renew(cb: CallbackQuery):
     tariffs = get_tariffs()
     price = tariffs.get(days)
     if not price:
+        # Тариф удалён — направляем в магазин
         await cb.answer("Тариф изменился, выберите новый.", show_alert=True)
         await cb.message.answer("💳 <b>Выберите тариф:</b>", reply_markup=kb_tariffs())
         return
@@ -3465,6 +3342,11 @@ async def cb_quick_renew(cb: CallbackQuery):
 #  FEATURE 3: HEALTH-CHECK ПАНЕЛИ КАЖДЫЕ 10 МИНУТ
 # ══════════════════════════════════════════════════════════════════════════════
 async def panel_health_check():
+    """
+    Пингует панель каждые 10 минут.
+    Если недоступна > 30 минут — шлёт алерт всем админам (один раз на инцидент).
+    Когда панель восстанавливается — уведомляет о восстановлении.
+    """
     global _panel_down_since
     ok, detail = await panel.ping()
 
@@ -3475,9 +3357,11 @@ async def panel_health_check():
             logger.warning(f"⚠️ Панель недоступна: {detail}")
         else:
             down_minutes = (now - _panel_down_since) / 60
+            # Алерт: первый раз когда > 30 минут и каждый следующий час
             elapsed = now - _panel_down_since
+            # Отправляем алерт на 30-й минуте и каждые 60 минут после
             thresholds = [30 * 60] + [30 * 60 + 60 * 60 * i for i in range(1, 48)]
-            prev_elapsed = elapsed - 600
+            prev_elapsed = elapsed - 600  # предыдущая проверка была 10 минут назад
             should_alert = any(prev_elapsed < t <= elapsed for t in thresholds)
             if should_alert:
                 down_min_int = int(down_minutes)
@@ -3507,13 +3391,18 @@ async def panel_health_check():
 #  FEATURE 4: ОНБОРДИНГ ПОСЛЕ АКТИВАЦИИ
 # ══════════════════════════════════════════════════════════════════════════════
 async def _send_onboarding(tg_id: int):
+    """
+    Отправляет пошаговую инструкцию новому пользователю.
+    Сначала спрашивает платформу — потом присылает инструкцию.
+    Вызывается только при первой активации (onboarded=0).
+    """
     with get_db() as conn:
         u = conn.execute("SELECT onboarded FROM users WHERE tg_id=?", (tg_id,)).fetchone()
         if not u or u["onboarded"]: return
         conn.execute("UPDATE users SET onboarded=1 WHERE tg_id=?", (tg_id,))
         conn.commit()
 
-    await asyncio.sleep(3)
+    await asyncio.sleep(3)  # небольшая пауза после QR-кода
     await safe_send(
         tg_id,
         "📲 <b>Выберите вашу платформу</b>\nПришлю пошаговую инструкцию по подключению:",
@@ -3598,6 +3487,7 @@ async def cb_onboard(cb: CallbackQuery):
 @dp.callback_query(F.data == "show_key")
 @handle_errors()
 async def cb_show_key_inline(cb: CallbackQuery):
+    """Быстрый показ ключа из онбординга."""
     await cb.answer()
     tg_id = cb.from_user.id
     with get_db() as conn:
@@ -3614,6 +3504,12 @@ async def cb_show_key_inline(cb: CallbackQuery):
 @dp.message(Command("check_panel"))
 @handle_errors()
 async def cmd_check_panel_diff(msg: Message):
+    """
+    Показывает расхождения между БД и панелью НЕ меняя ничего автоматически.
+    - Активны в БД, но отсутствуют на панели (возможно удалены вручную)
+    - Есть на панели, но не привязаны к TG ID в БД
+    Команда для диагностики, не для синхронизации (/sync_users).
+    """
     if not is_admin(msg.from_user.id): return
     await msg.answer("🔍 Сверяю БД с панелью, подождите...")
 
@@ -3640,7 +3536,10 @@ async def cmd_check_panel_diff(msg: Message):
             conn.execute("SELECT proxy_user FROM users WHERE proxy_user IS NOT NULL").fetchall()
         }
 
+    # 1) Активны в БД, но нет на панели
     only_in_db = [u for u in db_active if u["proxy_user"] not in panel_names]
+
+    # 2) Есть на панели, но нет в БД вообще (новые/ручные)
     only_on_panel = [
         name for name in panel_names
         if name not in db_all_proxies
@@ -3695,6 +3594,7 @@ async def check_expiring():
     d7    = (today + timedelta(days=7)).isoformat()
     today_s = today.isoformat()
 
+    # Сначала забираем всё из БД — не держим коннект через await
     with get_db() as conn:
         notify_7d = conn.execute(
             "SELECT tg_id, last_tariff_days FROM users WHERE subscription_end<=? AND subscription_end>? "
@@ -3714,6 +3614,7 @@ async def check_expiring():
         ).fetchall()
 
     def _renew_kb(last_days: int) -> InlineKeyboardMarkup:
+        """Кнопки продления: один тап если есть предыдущий тариф, иначе в магазин."""
         tariffs = get_tariffs()
         if last_days and last_days in tariffs:
             price = tariffs[last_days]
@@ -3730,6 +3631,7 @@ async def check_expiring():
             InlineKeyboardButton(text="💳 Продлить сейчас", callback_data="go_buy")
         ]])
 
+    # Уведомления — вне открытого коннекта
     for u in notify_7d:
         if await safe_send(u["tg_id"],
             "📅 <b>Подписка истекает через 7 дней.</b>\nПодготовьте оплату заранее.",
@@ -3758,6 +3660,7 @@ async def check_expiring():
                 conn.execute("UPDATE users SET notified_1d=1 WHERE tg_id=?", (u["tg_id"],))
                 conn.commit()
 
+    # Истёкшие — удаляем с панели, полностью очищаем данные в БД
     for u in expired:
         if u["proxy_user"]:
             await panel.delete_user(u["proxy_user"])
@@ -3773,74 +3676,11 @@ async def check_expiring():
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  НАПОМИНАНИЕ О РЕФЕРАЛАХ (раз в 2 недели)
-# ══════════════════════════════════════════════════════════════════════════════
-async def remind_referrals():
-    """
-    Раз в 2 недели напоминает активным пользователям пригласить друзей.
-    Сообщение в шутливой манере, с акцентом на выгоду (бонусные дни).
-    Чтобы избежать спама, напоминаем только тем, у кого notified_remind=0,
-    а после отправки ставим флаг в 1. Сброс флага происходит при продлении подписки.
-    """
-    logger.info("📢 Рассылка напоминаний о рефералах...")
-    
-    with get_db() as conn:
-        # Выбираем активных пользователей с активной подпиской, которым ещё не напоминали
-        users = conn.execute(
-            "SELECT tg_id, first_name, ref_balance FROM users "
-            "WHERE is_active=1 AND subscription_end > date('now') AND notified_remind=0 "
-            "ORDER BY tg_id DESC LIMIT 50",  # Лимит 50 за раз, чтобы не перегружать
-        ).fetchall()
-    
-    if not users:
-        logger.info("ℹ️ Нет пользователей для напоминания о рефералах.")
-        return
-    
-    bot_info = await bot.get_me()
-    
-    for u in users:
-        tg_id = u["tg_id"]
-        name = u["first_name"] or "Друг"
-        ref_code = ensure_ref_code(tg_id)
-        ref_link = f"https://t.me/{bot_info.username}?start=ref_{ref_code}"
-        
-        # Шутливое сообщение с акцентом на выгоду
-        text = (
-            f"👋 Привет, {name}!\n\n"
-            f"🤔 Знаешь, как получить <b>бесплатный VPN</b>? 😏\n\n"
-            f"Пригласи друзей по своей ссылке и получай <b>+{get_ref_bonus_pct():.0f}% дней</b> "
-            f"за каждую их оплату!\n\n"
-            f"💰 Твой текущий баланс: <b>{u['ref_balance']} дн.</b>\n\n"
-            f"🔗 Твоя ссылка:\n<code>{ref_link}</code>\n\n"
-            f"😄 Это не магия, это рефералка! Чем больше друзей — тем дольше бесплатный VPN.\n"
-            f"А мы будем любить тебя ещё сильнее! ❤️\n\n"
-            f"👥 Жми «👥 Рефералы» в меню, чтобы узнать подробности!"
-        )
-        
-        try:
-            sent = await safe_send(
-                tg_id,
-                text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="👥 Моя рефералка", callback_data="my_ref_link"),
-                ]])
-            )
-            if sent:
-                with get_db() as conn:
-                    conn.execute("UPDATE users SET notified_remind=1 WHERE tg_id=?", (tg_id,))
-                    conn.commit()
-                logger.debug(f"✅ Напоминание отправлено пользователю {tg_id}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки напоминания пользователю {tg_id}: {e}")
-    
-    logger.info(f"📊 Напоминания отправлены {len(users)} пользователям.")
-
-
 async def check_trials():
     now   = datetime.now(TZ).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
     warn6 = (datetime.now(TZ).replace(tzinfo=None) + timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S")
 
+    # Собираем списки до await-вызовов, не держим коннект через await
     with get_db() as conn:
         notify_6h_list = conn.execute(
             "SELECT tg_id FROM trials WHERE expires_at <= ? AND expires_at > ? "
@@ -3865,6 +3705,7 @@ async def check_trials():
                 conn.execute("UPDATE trials SET notified_6h=1 WHERE tg_id=?", (u["tg_id"],))
                 conn.commit()
 
+    # await вынесен за пределы with get_db — нет риска "database is locked"
     for u in expired_trials:
         if u["proxy_user"]:
             await panel.delete_user(u["proxy_user"])
@@ -3875,166 +3716,25 @@ async def check_trials():
 
 
 async def sync_traffic():
-    """
-    Синхронизирует трафик пользователей и проверяет лимит одновременных сессий.
-    При превышении лимита (1 ключ используется > 1 устройствами) отправляет предупреждения.
-    После 40 минут нарушений — блокирует пользователя.
-    """
+    """Синхронизация трафика из панели NaiveProxy в БД."""
     try:
         panel_users = await panel.list_users()
         if not panel_users:
             return
-        
-        now = datetime.now(TZ).replace(tzinfo=None)
-        
         with get_db() as conn:
             for pu in panel_users:
                 uname = pu.get("username") or pu.get("name", "")
                 up    = pu.get("upload",   pu.get("up",   0)) or 0
                 down  = pu.get("download", pu.get("down", 0)) or 0
-                
-                # Получаем дополнительные данные о сессиях из панели (если доступны)
-                # В NaiveProxy Panel нет прямого API для сессий, поэтому эмулируем проверку
-                # по изменению трафика за короткий промежуток времени
-                sessions_count = pu.get("sessions", 1)  # По умолчанию 1 сессия
-                
                 if uname:
-                    # Обновляем трафик
                     conn.execute(
                         "UPDATE users SET traffic_up=?, traffic_down=? WHERE proxy_user=?",
                         (up, down, uname),
                     )
-                    
-                    # Проверяем лимит сессий (эмуляция: если трафик растёт слишком быстро, считаем что несколько устройств)
-                    user_row = conn.execute(
-                        "SELECT tg_id, concurrent_sessions, last_session_check, session_warn_count, "
-                        "session_blocked_at, is_active FROM users WHERE proxy_user=?",
-                        (uname,)
-                    ).fetchone()
-                    
-                    if user_row:
-                        tg_id = user_row["tg_id"]
-                        prev_sessions = user_row["concurrent_sessions"] or 0
-                        last_check = user_row["last_session_check"]
-                        warn_count = user_row["session_warn_count"] or 0
-                        blocked_at = user_row["session_blocked_at"]
-                        is_active = user_row["is_active"]
-                        
-                        # Эмуляция: считаем что сессий > 1 если трафик большой (>100MB)
-                        # В реальности нужно парсить логи Caddy или использовать модуль forward_proxy
-                        total_traffic = up + down
-                        current_sessions = 2 if total_traffic > 100 * 1024 * 1024 else 1  # 100MB порог
-                        
-                        # Если сессий больше 1 — это нарушение
-                        if current_sessions > 1:
-                            # Первое нарушение — предупреждение пользователю
-                            if warn_count == 0:
-                                conn.execute("""
-                                    UPDATE users 
-                                    SET concurrent_sessions=?, last_session_check=?, session_warn_count=1
-                                    WHERE proxy_user=?
-                                """, (current_sessions, now, uname))
-                                
-                                # Отправляем предупреждение пользователю
-                                fire_and_forget(_send_session_warning(tg_id, uname))
-                                
-                                # Уведомляем админа
-                                for admin_id in ({ADMIN_ID} | EXTRA_ADMINS):
-                                    fire_and_forget(safe_send(
-                                        admin_id,
-                                        f"⚠️ <b>Нарушение лимита сессий!</b>\n\n"
-                                        f"👤 Пользователь: {uname} (TG: {tg_id})\n"
-                                        f"📊 Трафик: {total_traffic / 1024 / 1024:.1f} MB\n"
-                                        f"🔸 Предполагаемых сессий: {current_sessions}\n\n"
-                                        f"Отправлено предупреждение пользователю. "
-                                        f"При продолжении нарушения через 40 минут доступ будет заблокирован."
-                                    ))
-                                logger.warning(f"⚠️ Предупреждение о сессиях отправлено пользователю {uname}")
-                            
-                            # Повторное нарушение (прошло > 40 минут) — блокировка
-                            elif warn_count >= 1 and last_check:
-                                last_check_dt = datetime.strptime(last_check, "%Y-%m-%d %H:%M:%S") if isinstance(last_check, str) else last_check
-                                minutes_since_warn = (now - last_check_dt).total_seconds() / 60
-                                
-                                if minutes_since_warn >= 40 and not blocked_at:
-                                    # Блокируем пользователя
-                                    conn.execute("""
-                                        UPDATE users 
-                                        SET is_active=0, session_blocked_at=?, concurrent_sessions=?
-                                        WHERE proxy_user=?
-                                    """, (now, current_sessions, uname))
-                                    
-                                    # Удаляем из панели
-                                    fire_and_forget(_remove_user_from_panel(uname))
-                                    
-                                    # Уведомляем пользователя
-                                    fire_and_forget(safe_send(
-                                        tg_id,
-                                        "🚫 <b>Доступ заблокирован!</b>\n\n"
-                                        "Ваш ключ VPN был заблокирован из-за многократного нарушения правил:\n"
-                                        "❌ Превышен лимит одновременных подключений.\n\n"
-                                        "Один ключ предназначен для использования только на одном устройстве.\n"
-                                        "Если вам нужен доступ с нескольких устройств — оформите отдельные подписки.\n\n"
-                                        "Для разблокировки обратитесь в поддержку."
-                                    ))
-                                    
-                                    # Уведомляем админа
-                                    for admin_id in ({ADMIN_ID} | EXTRA_ADMINS):
-                                        fire_and_forget(safe_send(
-                                            admin_id,
-                                            f"🚫 <b>Пользователь заблокирован!</b>\n\n"
-                                            f"👤 {uname} (TG: {tg_id})\n"
-                                            f"⏱ Нарушение длилось {minutes_since_warn:.0f} мин\n"
-                                            f"🔒 Доступ к VPN отозван."
-                                        ))
-                                    
-                                    logger.warning(f"🚫 Пользователь {uname} заблокирован за нарушение лимита сессий")
-                            
-                            # Обновляем время последней проверки
-                            conn.execute(
-                                "UPDATE users SET last_session_check=? WHERE proxy_user=?",
-                                (now, uname)
-                            )
-                        else:
-                            # Сброс счётчика если нарушений нет
-                            if warn_count > 0:
-                                conn.execute("""
-                                    UPDATE users 
-                                    SET session_warn_count=0, last_session_check=?, concurrent_sessions=?
-                                    WHERE proxy_user=?
-                                """, (now, current_sessions, uname))
-            
             conn.commit()
-        
-        logger.info(f"📊 Трафик синхронизирован: {len(panel_users)} пользователей, проверены сессии")
+        logger.info(f"📊 Трафик синхронизирован: {len(panel_users)} пользователей")
     except Exception as e:
         logger.warning(f"Traffic sync error: {e}")
-
-
-async def _send_session_warning(tg_id: int, username: str, sessions_count: int, limit: int):
-    """Отправляет предупреждение пользователю о нарушении лимита сессий"""
-    text = (
-        "⚠️ <b>Предупреждение о безопасности!</b>\n\n"
-        f"Уважаемый пользователь ({username}),\n\n"
-        f"Мы обнаружили, что ваш ключ VPN используется одновременно на <b>{sessions_count} устройствах</b>.\n\n"
-        "📜 <b>Правила использования:</b>\n"
-        f"• Один ключ = максимум {limit} устройства(а)\n"
-        "• Передача ключа третьим лицам запрещена\n\n"
-        "⏰ У вас есть <b>40 минут</b>, чтобы отключить лишние устройства.\n"
-        "В противном случае доступ будет автоматически заблокирован.\n\n"
-        "Если вы считаете что это ошибка — обратитесь в поддержку."
-    )
-    await safe_send(tg_id, text)
-
-
-async def _remove_user_from_panel(username: str):
-    """Удаляет пользователя из панели NaiveProxy"""
-    try:
-        if hasattr(panel, 'delete_user'):
-            await panel.delete_user(username)
-            logger.info(f"✅ Пользователь {username} удалён из панели")
-    except Exception as e:
-        logger.error(f"❌ Ошибка удаления пользователя {username} из панели: {e}")
 
 
 async def recover_stuck_payments():
@@ -4065,8 +3765,13 @@ async def recover_stuck_payments():
 
 
 async def daily_report():
+    """Ежедневный отчёт администратору в 9:00."""
+    # created_at / updated_at в SQLite хранятся как UTC (CURRENT_TIMESTAMP).
+    # Вычисляем границы вчера/сегодня в UTC чтобы сравнение было корректным.
     now_utc  = datetime.now(timezone.utc).replace(tzinfo=None)
     yday_utc = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
+    today_utc = now_utc.strftime("%Y-%m-%d")
+    # Отображаемая дата — московская
     display_date = datetime.now(TZ).date().isoformat()
     with get_db() as conn:
         new_users  = conn.execute(
@@ -4119,6 +3824,7 @@ def _run_daily_backup():
 
 
 async def daily_backup():
+    # FIX BUG 8: src.backup() блокирует event loop — выносим в executor
     try:
         await asyncio.get_running_loop().run_in_executor(None, _run_daily_backup)
     except Exception as e:
@@ -4131,6 +3837,7 @@ async def daily_backup():
 @dp.message(Command("sync"))
 @handle_errors()
 async def cmd_sync(msg: Message):
+    """Ручная синхронизация трафика с панелью."""
     if not is_admin(msg.from_user.id): return
     await msg.answer("🔄 Синхронизирую трафик с панелью...")
     await sync_traffic()
@@ -4140,6 +3847,7 @@ async def cmd_sync(msg: Message):
 @dp.message(Command("stats"))
 @handle_errors()
 async def cmd_stats_quick(msg: Message):
+    """Быстрая статистика по команде /stats."""
     if not is_admin(msg.from_user.id): return
     with get_db() as conn:
         act   = conn.execute("SELECT COUNT(*) FROM users WHERE is_active=1 AND tg_id > 0").fetchone()[0]
@@ -4260,7 +3968,7 @@ class MultiAdminFSM(StatesGroup):
 @dp.message(F.text == "👮 Администраторы")
 @handle_errors()
 async def admin_admins_list(msg: Message):
-    if not is_admin(msg.from_user.id): return
+    if not is_admin(msg.from_user.id): return  # только администраторы
     with get_db() as conn:
         rows = conn.execute(
             "SELECT a.tg_id, a.username, a.added_at, u.first_name "
@@ -4369,6 +4077,7 @@ def _users_page_text(page: int, only_active: bool = True) -> tuple[str, InlineKe
     for u in users:
         d    = days_left(u["subscription_end"])
         icon = "🔴" if d == 0 else ("🟡" if d <= 3 else "🟢")
+        # Показываем @username если есть, иначе first_name, иначе ID
         if u["username"]:
             name = f"@{u['username']}"
         elif u["first_name"]:
@@ -4378,29 +4087,16 @@ def _users_page_text(page: int, only_active: bool = True) -> tuple[str, InlineKe
         lines.append(f"{icon} <code>{u['tg_id']}</code> {name} | {u['subscription_end'] or '—'} ({d}д.)")
 
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-    
-    # Формируем навигацию
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="◀️", callback_data=f"upage:{page-1}:{int(only_active)}"))
     nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
     if (page + 1) * PAGE_SIZE < total:
         nav.append(InlineKeyboardButton(text="▶️", callback_data=f"upage:{page+1}:{int(only_active)}"))
-    
-    # Формируем кнопки для каждого пользователя (кликом можно выбрать)
-    user_buttons = []
-    for u in users:
-        user_buttons.append([
-            InlineKeyboardButton(
-                text=f"{'🔴' if days_left(u['subscription_end']) == 0 else ('🟡' if days_left(u['subscription_end']) <= 3 else '🟢')} {u['tg_id']} | {u['subscription_end'] or '—'}",
-                callback_data=f"uprof:{u['tg_id']}:{page}:{int(only_active)}"
-            )
-        ])
-    
+
     toggle_label = "👥 Все" if only_active else "🟢 Активные"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         nav,
-        *user_buttons,  # Кнопки пользователей
         [InlineKeyboardButton(text=toggle_label, callback_data=f"upage:0:{int(not only_active)}")],
     ])
     return "\n".join(lines), kb
@@ -4422,93 +4118,6 @@ async def cb_upage(cb: CallbackQuery):
     text, kb = _users_page_text(int(page_s), bool(int(active_s)))
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("uprof:"))
-@handle_errors()
-async def cb_user_profile(cb: CallbackQuery):
-    """Обработчик клика по пользователю в списке - показывает профиль с кнопками действий."""
-    if not is_admin(cb.from_user.id): return await cb.answer("⛔", show_alert=True)
-    
-    # Парсим данные: uprof:{tg_id}:{page}:{only_active}
-    parts = cb.data.split(":")
-    if len(parts) != 4:
-        return await cb.answer("❌ Некорректные данные", show_alert=True)
-    
-    tg_id = int(parts[1])
-    page = int(parts[2])
-    only_active = bool(int(parts[3]))
-    
-    await cb.answer()
-    
-    # Получаем информацию о пользователе
-    with get_db() as conn:
-        u = conn.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
-    
-    if not u:
-        return await cb.message.answer("❌ Пользователь не найден.")
-    
-    # Формируем профиль пользователя с кнопками действий
-    cur_end = u["subscription_end"] or "—"
-    d_left = days_left(u["subscription_end"]) if u["is_active"] else 0
-    status = f"🟢 {d_left} дн." if u["is_active"] else "🔴 Неактивен"
-    name = (u["first_name"] or "") + (f" (@{u['username']})" if u["username"] else "")
-    
-    # Получаем трафик
-    traffic = 0
-    if u["proxy_user"]:
-        stats = await panel.get_traffic_stats(u["proxy_user"])
-        traffic = stats.get("total_bytes", 0) if stats else 0
-    
-    # Считаем количество оплат
-    with get_db() as conn:
-        pay_cnt = conn.execute(
-            "SELECT COUNT(*) FROM subscription_history WHERE tg_id=? AND action='pay'", 
-            (tg_id,)
-        ).fetchone()[0]
-    
-    # Считаем рефералов
-    with get_db() as conn:
-        ref_cnt = conn.execute(
-            "SELECT COUNT(*) FROM users WHERE referrer_id=? AND is_active=1", 
-            (tg_id,)
-        ).fetchone()[0]
-    
-    # Формируем ссылку
-    key = "—"
-    if u["proxy_user"] and u["proxy_pass"]:
-        key = f"naive+https://{u['proxy_user']}:{u['proxy_pass']}@{DOMAIN}:443"
-    
-    profile_text = (
-        f"👤 <b>Профиль пользователя</b>\n\n"
-        f"🆔 ID: <code>{tg_id}</code>\n"
-        f"👤 Имя: {safe_html(name)}\n"
-        f"📊 Статус: {status}\n"
-        f"📅 Подписка до: <b>{cur_end}</b>\n"
-        f"👤 Proxy: <code>{u['proxy_user'] or '—'}</code>\n"
-        f"📊 Трафик: {fmt_traffic(traffic)}\n\n"
-        f"💰 Оплат: {pay_cnt} | 👥 Рефералов: {ref_cnt}\n"
-        f"🎁 Реф. баланс: {u.get('ref_balance', 0)} дн.\n\n"
-        f"🔑 Ключ:\n<code>{key}</code>"
-    )
-    
-    # Кнопки действий
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="➕ Выдать тариф", callback_data=f"admin_add:{tg_id}:sel"),
-            InlineKeyboardButton(text="➖ Отнять дни", callback_data=f"admin_subtract:{tg_id}:sel"),
-        ],
-        [
-            InlineKeyboardButton(
-                text="🚫 Бан" if not u.get("is_banned") else "✅ Разбан",
-                callback_data=f"ban_toggle:{tg_id}",
-            ),
-        ],
-        [InlineKeyboardButton(text="🔴 Деактивировать", callback_data=f"deactivate:{tg_id}")],
-        [InlineKeyboardButton(text="🔙 Назад к списку", callback_data=f"upage:{page}:{int(only_active)}")],
-    ])
-    
-    await cb.message.answer(profile_text, reply_markup=kb)
 
 
 @dp.callback_query(F.data == "noop")
@@ -4594,6 +4203,7 @@ async def _do_mass_extend(source, days: int, edit: bool = False):
             notify_list.append((u["tg_id"], new_end))
             cnt += 1
         conn.commit()
+    # Уведомляем после закрытия соединения
     for tg_id, new_end in notify_list:
         fire_and_forget(safe_send(tg_id, f"🎁 <b>Подарок от сервиса!</b>\nВаша подписка продлена на <b>{days} дн.</b>\n📅 До: <b>{new_end}</b>"))
     await asyncio.sleep(0)
@@ -4603,14 +4213,18 @@ async def _do_mass_extend(source, days: int, edit: bool = False):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  СПИСОК ЗАБАНЕННЫХ
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ИМПОРТ / РУЧНАЯ ПРИВЯЗКА КЛИЕНТОВ С ПАНЕЛИ
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LinkUserFSM(StatesGroup):
-    proxy_user  = State()
-    proxy_pass  = State()
-    tg_id       = State()
-    sub_end     = State()
+    proxy_user  = State()   # шаг 1 — вводим proxy_user
+    proxy_pass  = State()   # шаг 2 — вводим пароль (или авто с панели)
+    tg_id       = State()   # шаг 3 — вводим Telegram ID
+    sub_end     = State()   # шаг 4 — вводим дату подписки (или пропускаем)
 
 
 async def _do_link_user(
@@ -4621,6 +4235,7 @@ async def _do_link_user(
     sub_end: str = "",
     notify: bool = True,
 ):
+    """Общая логика привязки — используется и FSM и командой /link."""
     error_text = None
     with get_db() as conn:
         existing = conn.execute(
@@ -4661,6 +4276,7 @@ async def _do_link_user(
                 )
             conn.commit()
 
+    # await вынесен за пределы with get_db()
     if error_text:
         await source.answer(error_text)
         return False
@@ -4685,6 +4301,7 @@ async def _do_link_user(
     return True
 
 
+# ── Кнопка «🔄 Импорт с панели» ──────────────────────────────────────────────
 @dp.message(F.text == "🔄 Импорт с панели")
 @handle_errors()
 async def admin_import_panel(msg: Message, state: FSMContext):
@@ -4706,6 +4323,7 @@ async def admin_import_panel(msg: Message, state: FSMContext):
                not u["username"].startswith("_test_") and
                not u["username"].startswith("trial_")
         ]
+        # Из БД берём тех у кого нет реального TG ID (заглушки)
         with get_db() as conn:
             no_tgid_set = {
                 r["proxy_user"] for r in conn.execute(
@@ -4750,6 +4368,7 @@ async def admin_import_panel(msg: Message, state: FSMContext):
     )
 
 
+# ── FSM: шаг 1 — старт ───────────────────────────────────────────────────────
 @dp.callback_query(F.data == "link_start")
 @handle_errors()
 async def cb_link_start(cb: CallbackQuery, state: FSMContext):
@@ -4766,6 +4385,7 @@ async def cb_link_start(cb: CallbackQuery, state: FSMContext):
     )
 
 
+# ── FSM: шаг 1 — получаем proxy_user ─────────────────────────────────────────
 @dp.message(LinkUserFSM.proxy_user)
 @handle_errors()
 async def link_got_proxy_user(msg: Message, state: FSMContext):
@@ -4774,6 +4394,7 @@ async def link_got_proxy_user(msg: Message, state: FSMContext):
     if not re.match(r'^[a-z0-9_\-\.]{1,32}$', proxy_user, re.IGNORECASE):
         return await msg.answer("❌ Логин может содержать только латиницу, цифры, _ и -. Попробуйте ещё раз.")
 
+    # Пробуем автоматически найти пароль на панели
     panel_users = await panel.list_users()
     auto_pass = next(
         (u.get("password", "") for u in panel_users if u.get("username") == proxy_user), None
@@ -4819,6 +4440,7 @@ async def cb_link_use_auto_pass(cb: CallbackQuery, state: FSMContext):
     )
 
 
+# ── FSM: шаг 2 — получаем пароль ─────────────────────────────────────────────
 @dp.message(LinkUserFSM.proxy_pass)
 @handle_errors()
 async def link_got_proxy_pass(msg: Message, state: FSMContext):
@@ -4833,6 +4455,7 @@ async def link_got_proxy_pass(msg: Message, state: FSMContext):
     )
 
 
+# ── FSM: шаг 3 — получаем tg_id ──────────────────────────────────────────────
 @dp.message(LinkUserFSM.tg_id)
 @handle_errors()
 async def link_got_tg_id(msg: Message, state: FSMContext):
@@ -4862,6 +4485,7 @@ async def cb_link_skip_date(cb: CallbackQuery, state: FSMContext):
     await _do_link_user(cb.message, data["proxy_user"], data["proxy_pass"], data["tg_id"], sub_end="")
 
 
+# ── FSM: шаг 4 — получаем дату подписки ──────────────────────────────────────
 @dp.message(LinkUserFSM.sub_end)
 @handle_errors()
 async def link_got_sub_end(msg: Message, state: FSMContext):
@@ -4874,9 +4498,17 @@ async def link_got_sub_end(msg: Message, state: FSMContext):
     await _do_link_user(msg, data["proxy_user"], data["proxy_pass"], data["tg_id"], sub_end=raw)
 
 
+# ── Команда /link для быстрой привязки ───────────────────────────────────────
 @dp.message(Command("link"))
 @handle_errors()
 async def cmd_link_user(msg: Message):
+    """
+    Быстрая привязка клиента командой.
+    Варианты:
+      /link proxy_user tg_id
+      /link proxy_user tg_id пароль
+      /link proxy_user tg_id пароль дата(ГГГГ-ММ-ДД)
+    """
     if not is_admin(msg.from_user.id): return
     parts = msg.text.split(maxsplit=4)
 
@@ -4897,6 +4529,7 @@ async def cmd_link_user(msg: Message):
     proxy_pass = parts[3].strip() if len(parts) > 3 else None
     sub_end    = parts[4].strip() if len(parts) > 4 else ""
 
+    # Если пароль не указан — тянем с панели
     if not proxy_pass:
         await msg.answer("⏳ Ищу пользователя на панели...")
         panel_users = await panel.list_users()
@@ -4911,7 +4544,6 @@ async def cmd_link_user(msg: Message):
             )
 
     await _do_link_user(msg, proxy_user, proxy_pass, tg_id, sub_end=sub_end)
-
 
 @dp.message(F.text == "📥 Экспорт платежей")
 @handle_errors()
@@ -4955,9 +4587,11 @@ async def admin_csv_payments(msg: Message):
 @handle_errors()
 async def admin_chart(msg: Message):
     if not is_admin(msg.from_user.id): return
+    # Используем МСК дату, а не UTC DATE('now').
+    # created_at хранится в UTC → прибавляем смещение чтобы группировка была по МСК-дням.
     tz_today   = datetime.now(TZ).date()
     since_date = (tz_today - timedelta(days=7)).isoformat()
-    tz_offset  = "+3 hours"
+    tz_offset  = "+3 hours"  # Europe/Moscow UTC+3 (без перехода на летнее время)
     with get_db() as conn:
         rows_reg = conn.execute(f"""
             SELECT DATE(created_at, '{tz_offset}') as d, COUNT(*) as cnt
@@ -5008,6 +4642,7 @@ async def fallback_handler(msg: Message, state: FSMContext):
     if get_setting("maintenance") == "1" and not is_admin(tg_id):
         return await msg.answer("🔧 Бот на техническом обслуживании.")
 
+    # Для администратора проверяем — вдруг застрял в FSM
     if is_admin(tg_id):
         current = await state.get_state()
         if current:
@@ -5016,7 +4651,7 @@ async def fallback_handler(msg: Message, state: FSMContext):
                 "⚠️ Предыдущий диалог отменён. Используйте кнопки меню.",
                 reply_markup=kb_admin(),
             )
-        return
+        return  # не в FSM — просто игнорируем
 
     await msg.answer(
         "🤷 Не понял команду.\n\n"
@@ -5029,9 +4664,16 @@ async def fallback_handler(msg: Message, state: FSMContext):
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  STARTUP / SHUTDOWN
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  АВТОСИНХРОНИЗАЦИЯ КЛИЕНТОВ С ПАНЕЛИ
 # ══════════════════════════════════════════════════════════════════════════════
 async def sync_panel_users(notify_admin: bool = False):
+    """
+    Синхронизирует пользователей панели с базой данных бота.
+    Защищён sync_lock — нельзя запустить параллельно (scheduler + ручной /sync_users).
+    """
     if sync_lock.locked():
         logger.warning("sync_panel_users: уже выполняется, пропускаем")
         return
@@ -5040,6 +4682,7 @@ async def sync_panel_users(notify_admin: bool = False):
         logger.info("🔄 Синхронизация пользователей с панели...")
         panel_users = await panel.list_users()
 
+        # Фикс 1.2: проверяем что получили именно список, а не None/dict
         if not isinstance(panel_users, list):
             logger.error(f"sync_panel_users: panel.list_users() вернул {type(panel_users)}, ожидался list — прерываем")
             return
@@ -5067,6 +4710,7 @@ async def sync_panel_users(notify_admin: bool = False):
             min_id_row   = conn.execute("SELECT COALESCE(MIN(tg_id), 0) FROM users").fetchone()
             next_fake_id = min_id_row[0] - 1
 
+            # Шаг 1: bulk update/insert через executemany (фикс 3.1)
             to_update = []
             to_insert = []
             for pu in panel_users:
@@ -5100,6 +4744,8 @@ async def sync_panel_users(notify_admin: bool = False):
                     to_insert,
                 )
 
+            # Шаг 2: деактивируем тех кого нет на панели
+            # Фикс 1.1: сразу материализуем как dict чтобы не было lazy-ссылок
             active_in_db = [
                 dict(r) for r in conn.execute(
                     "SELECT tg_id, proxy_user, subscription_end FROM users "
@@ -5137,6 +4783,7 @@ async def sync_panel_users(notify_admin: bool = False):
             f"создано={created}, пропущено={skipped}, деактивировано={removed}"
         )
 
+        # Уведомления — после закрытия коннекта
         deactivated_users = [u for u in active_in_db if u["tg_id"] in set(deactivate_ids if deactivate_ids else [])]
         for u in deactivated_users:
             await safe_send(
@@ -5158,12 +4805,14 @@ async def sync_panel_users(notify_admin: bool = False):
                 await safe_send(admin_id, "\n".join(lines))
 
 
+# ── Ручной запуск синхронизации ───────────────────────────────────────────────
 _last_sync_time: float = 0.0
-SYNC_COOLDOWN_SEC = 120
+SYNC_COOLDOWN_SEC = 120  # минимум 2 минуты между ручными синхронизациями
 
 @dp.message(Command("sync_users"))
 @handle_errors()
 async def cmd_sync_users(msg: Message):
+    """Ручная синхронизация пользователей с панели."""
     if not is_admin(msg.from_user.id): return
     global _last_sync_time
     elapsed = time.time() - _last_sync_time
@@ -5176,6 +4825,7 @@ async def cmd_sync_users(msg: Message):
     await msg.answer("🔄 Синхронизирую пользователей с панелью...")
     await sync_panel_users(notify_admin=False)
 
+    # Показываем итог
     with get_db() as conn:
         total   = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         active  = conn.execute("SELECT COUNT(*) FROM users WHERE is_active=1").fetchone()[0]
@@ -5199,6 +4849,10 @@ async def cmd_sync_users(msg: Message):
 @dp.message(Command("sync_check"))
 @handle_errors()
 async def cmd_sync_check(msg: Message):
+    """
+    /sync_check — сверка + немедленная деактивация расхождений.
+    /check_panel — только показать расхождения без изменений.
+    """
     if not is_admin(msg.from_user.id): return
     if sync_lock.locked():
         return await msg.answer("⏳ Синхронизация уже выполняется, подождите.")
@@ -5217,6 +4871,11 @@ async def cmd_sync_check(msg: Message):
 @dp.message(Command("check_user"))
 @handle_errors()
 async def cmd_check_user(msg: Message):
+    """
+    Мгновенная проверка конкретного пользователя по панели.
+    Использование: /check_user TELEGRAM_ID
+    Если пользователь отсутствует на панели — деактивирует его в БД.
+    """
     if not is_admin(msg.from_user.id): return
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip().lstrip("-").isdigit():
@@ -5248,6 +4907,7 @@ async def cmd_check_user(msg: Message):
             f"Статус в БД: {status}"
         )
 
+    # Не найден на панели
     if u["is_active"]:
         with get_db() as conn:
             conn.execute(
@@ -5280,13 +4940,11 @@ async def cmd_check_user(msg: Message):
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  STARTUP / SHUTDOWN
-# ══════════════════════════════════════════════════════════════════════════════
 async def on_startup():
     await init_db()
     await panel.login()
 
+    # Загружаем дополнительных администраторов из БД
     try:
         with get_db() as conn:
             rows = conn.execute("SELECT tg_id FROM admins").fetchall()
@@ -5296,6 +4954,7 @@ async def on_startup():
     except Exception as e:
         logger.warning(f"Ошибка загрузки администраторов: {e}")
 
+    # Кнопка меню с командами
     try:
         from aiogram.types import BotCommand, BotCommandScopeDefault, MenuButtonCommands
         await bot.set_my_commands([
@@ -5313,9 +4972,12 @@ async def on_startup():
     except Exception as e:
         logger.warning(f"Не удалось установить кнопку меню: {e}")
 
+    # Планировщик задач
+    # max_instances=1  — одновременно только одна копия задачи
+    # coalesce=True    — если бот лежал и пропустил N запусков, запустить ровно 1 раз
+    # misfire_grace_time=300 — задача считается пропущенной если опоздала >5 минут
     JOB_DEFAULTS = dict(max_instances=1, coalesce=True, misfire_grace_time=300)
-    # Изменено: проверка истекших подписок теперь каждый час (было 6 часов) для быстрого отключения неплательщиков
-    scheduler.add_job(check_expiring,          IntervalTrigger(hours=1),           **JOB_DEFAULTS)
+    scheduler.add_job(check_expiring,          IntervalTrigger(hours=6),           **JOB_DEFAULTS)
     scheduler.add_job(check_trials,            IntervalTrigger(minutes=30),         **JOB_DEFAULTS)
     scheduler.add_job(sync_traffic,            IntervalTrigger(hours=2),            **JOB_DEFAULTS)
     scheduler.add_job(sync_panel_users,        IntervalTrigger(hours=6),            **JOB_DEFAULTS)
@@ -5325,12 +4987,11 @@ async def on_startup():
     scheduler.add_job(cleanup_stale_fsm,       IntervalTrigger(minutes=30),         **JOB_DEFAULTS)
     scheduler.add_job(daily_backup,            CronTrigger(hour=3,  minute=0, timezone=TIMEZONE), **JOB_DEFAULTS)
     scheduler.add_job(daily_report,            CronTrigger(hour=9,  minute=0, timezone=TIMEZONE), **JOB_DEFAULTS)
-    # Напоминание о рефералах раз в 2 недели (понедельник в 12:00)
-    scheduler.add_job(remind_referrals,        CronTrigger(hour=12, minute=0, day_of_week='mon', timezone=TIMEZONE), **JOB_DEFAULTS)
     scheduler.start()
     logger.info("🚀 NaiveProxy Bot v3 запущен")
     for _aid in ({ADMIN_ID} | EXTRA_ADMINS):
         fire_and_forget(safe_send(_aid, "🚀 <b>Бот запущен и готов к работе!</b>"))
+    # Синхронизация с панелью при старте
     fire_and_forget(sync_panel_users(notify_admin=True))
 
 
